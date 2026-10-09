@@ -1,0 +1,53 @@
+name: ci
+
+# Runs on every push to main and every pull request, and can be started by hand
+# from the Actions tab.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # Run all three platforms even if one fails, so a single run shows the
+      # status of every platform rather than stopping at the first failure.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      # Clone the repository at the commit being checked.
+      - uses: actions/checkout@v5
+
+      # Install the Go version named in go.mod, so every platform builds with
+      # the same version this repository declares.
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      # Compile every package and write the ./pisquared executable. CGO is off
+      # because the released binary is static; building with cgo on would let
+      # something pass here that fails for someone running the static binary.
+      - name: Build
+        run: go build ./...
+        env:
+          CGO_ENABLED: "0"
+
+      # Report suspicious constructs that compile but are probably wrong.
+      - name: Vet
+        run: go vet ./...
+        env:
+          CGO_ENABLED: "0"
+
+      # Run every test in the module. Exit status is non-zero if any test fails,
+      # which fails the job and, through it, the matrix entry for this platform.
+      - name: Test
+        run: go test ./...
+        env:
+          CGO_ENABLED: "0"

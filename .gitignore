@@ -1,0 +1,9 @@
+openspec/*
+preliminary_plans/*
+.opencode/*
+.agents/*
+skills-lock.json
+
+# Build output from `go build ./...`
+/pisquared
+/pisquared.exe
