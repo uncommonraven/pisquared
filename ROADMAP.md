@@ -43,7 +43,7 @@ its credential and enrolment decisions have a settled host to apply to.
 
 | Version | Result | Check | Hardware |
 |---|---|---|---|
-| **v0.1** | A verified, flashable base image | tool output and hand-run procedure both match the publisher's published hash, and its signature verifies | no |
+| **v0.1** | A verified, flashable base image | tool output matches the publisher's published hash, and its signature verifies | no |
 | **v0.2** | An image carrying the operator's configuration | differs from upstream in exactly the documented fields; no mount, no elevation | no |
 | **v0.3** | A device reachable without a console | flash, power on with nothing attached, key login, password refused | yes |
 | **v0.4** | One agent session completes | a session runs end to end | yes |
@@ -60,8 +60,10 @@ to discover.
 ## What v0.1 establishes, and what it does not
 
 v0.1's output is an **unmodified upstream image**. Nothing this project produces is in it. That is
-deliberate: it is what allows the exit criterion to compare two independent routes against the publisher's
-own published hash with no hardware involved.
+deliberate: it is what allows the exit criterion to compare against the publisher's own published hash with
+no hardware involved. That check compares one route — the tool's — rather than the two independent routes
+originally planned, because the manual procedure that would have been the second is deferred. See the
+requirements on manual paths above.
 
 **v0.2 is the first version that emits something of ours.** Worth stating plainly so the ladder is not read
 as though v0.1 already produces a pisquared image.
@@ -93,7 +95,15 @@ cannot fail unless that is turned on deliberately.
 Some properties are true from the first version rather than appearing at one:
 
 - **The manual path stays first-class.** What is done by hand is written down as it is done, and the tool is
-  checked against the written procedure rather than replacing it.
+  checked against the written procedure rather than replacing it. It will be documented, though not
+  necessarily at the same time as the tool that replaces it. v0.1 is the exception that shows this is a real
+  deferral rather than a settled habit: the manual obtaining procedure was planned to be written there, before
+  the tool, and is deferred to a concentrated documentation effort instead. The tool ships first and the page
+  follows. The consequence is recorded rather than papered over — v0.1's operator whose device is not in the
+  catalogue has no route, and v0.1's end-to-end check compares the tool's output against the publisher's
+  published hash without a second route confirming it independently. What is deferred is listed in
+  `openspec/changes/v0-1-image-download/proposal.md`, and the reasoning for writing the procedure first is
+  kept in that change's `design.md` so the documentation effort inherits it.
 - **Documentation lands with the work it describes.** Not as a parallel axis — as part of the group whose
   work calls for it.
 - **Nothing claims a property before the version that makes it true.** The archived spec after v0.5

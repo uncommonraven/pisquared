@@ -51,3 +51,33 @@ jobs:
         run: go test ./...
         env:
           CGO_ENABLED: "0"
+
+  # The catalogue is committed data, and the mapping it holds cannot be derived
+  # from upstream: DietPi publishes a directory listing of filenames and nothing
+  # saying which device each one boots. The one failure that can be caught is
+  # upstream renaming or removing an image, which would otherwise reach an
+  # operator as a 404 partway through a 200 MiB download. So every committed
+  # address is requested here, and the build fails naming the entry and the
+  # address if one does not resolve.
+  #
+  # This is one platform on purpose. The check asks a remote server whether it
+  # serves a file; running it three times over the same four addresses triples
+  # the requests without covering anything a second run could, and would turn
+  # one upstream slowdown into three red builds.
+  catalogue-addresses:
+    name: catalogue addresses resolve
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      # Behind the `online` tag because it reaches the publisher's servers. A
+      # developer's `go test ./...` must not fail because dietpi.com is slow;
+      # this job is where that belongs.
+      - name: Every committed image address resolves
+        run: go test -tags=online -run TestEveryCommittedAddressResolves -v ./internal/catalogue/
+        env:
+          CGO_ENABLED: "0"

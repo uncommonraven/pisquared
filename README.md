@@ -25,6 +25,11 @@ Also in this version:
 
 - A committed table mapping device families to image addresses, with a build-time check that every address in
   it still resolves, so upstream renaming an image fails here rather than on your machine mid-download.
+
+  Four images cover fourteen devices. The Pi 4, the Pi 400, and the Compute Module 4 are one image and are
+  listed as one choice. The Pi 2 is two, because its two board revisions need different ones. A device the
+  table does not carry resolves to no image at all — there is no default and no nearest match, because a
+  wrong image is discovered after a card has been erased rather than before.
 - A [bubbletea](https://github.com/charmbracelet/bubbletea) interface that is a view over a step log. All
   deciding and all work happens in packages that never import the interface, so the whole thing runs and is
   tested with no terminal attached.
