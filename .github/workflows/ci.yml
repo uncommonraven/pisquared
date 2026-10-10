@@ -1,11 +1,8 @@
 name: ci
 
-# Runs on every push to main and every pull request, and can be started by hand
-# from the Actions tab.
+# Manual only. The Go implementation is being deprecated, so this never runs on
+# push or pull request; it can be started by hand from the Actions tab.
 on:
-  push:
-    branches: [main]
-  pull_request:
   workflow_dispatch:
 
 permissions:
