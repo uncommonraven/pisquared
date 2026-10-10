@@ -1,0 +1,41 @@
+name: rust
+
+# Format, lint, and test the Rust crate on all three platforms. Runs on every push
+# to main and on every pull request, so a Windows-only failure shows up here.
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # Run all three platforms even if one fails, so a single run shows the
+      # status of every platform rather than stopping at the first failure.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v5
+
+      # rust-toolchain.toml pins the toolchain, so rustup installs that exact
+      # version here and every platform builds with the same compiler.
+      - name: Show toolchain
+        run: cargo --version && rustc --version
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Lint
+        run: cargo clippy -- -D warnings
+
+      # The xz decoder vendors and compiles liblzma, so this also proves the C
+      # toolchain on each platform can build the crate from a clean checkout.
+      - name: Test
+        run: cargo test

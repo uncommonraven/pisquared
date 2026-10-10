@@ -8,6 +8,9 @@ Work proceeds one version at a time along the ladder in [`ROADMAP.md`](ROADMAP.m
 single observable result that someone else could check rather than take on trust. **The project is at v0.1.**
 Nothing below describes a finished program.
 
+v0.1 is being rewritten in Rust. The Go implementation is still in this repository and is removed once the Rust
+version replaces it.
+
 ## What v0.1 produces
 
 **A verified, flashable base image, and nothing else.**
@@ -30,7 +33,7 @@ Also in this version:
   listed as one choice. The Pi 2 is two, because its two board revisions need different ones. A device the
   table does not carry resolves to no image at all — there is no default and no nearest match, because a
   wrong image is discovered after a card has been erased rather than before.
-- A [bubbletea](https://github.com/charmbracelet/bubbletea) interface that is a view over a step log. All
+- A [ratatui](https://ratatui.rs) interface that is a view over a step log. All
   deciding and all work happens in packages that never import the interface, so the whole thing runs and is
   tested with no terminal attached.
 - A non-interactive mode that runs the identical code path and differs only in where the log is rendered.
@@ -63,16 +66,36 @@ from its documentation is the artifact that matters.
 
 ## Building
 
-Requires Go 1.27 or later. The result is a single static executable with nothing to install beside it.
+You need:
+
+- **A Rust toolchain.** [rustup](https://rustup.rs) installs the exact version pinned in
+  [`rust-toolchain.toml`](rust-toolchain.toml) the first time you build. The minimum supported version is
+  recorded in [`Cargo.toml`](Cargo.toml).
+- **A C compiler.** The xz decoder builds liblzma from source. Linux and macOS need `gcc` or `clang`. Windows
+  needs the MSVC build tools (the "Desktop development with C++" workload in Visual Studio Build Tools). No
+  system liblzma package is needed.
+
+```sh
+cargo build --release   # writes target/release/pisquared
+cargo test
+```
+
+The binary currently prints its version. The download, verification, and decompression steps are not built yet.
+
+Rust format, lint, and test checks run on Linux, macOS, and Windows in
+[`.github/workflows/rust.yml`](.github/workflows/rust.yml) on every push to `main` and on every pull request. A
+platform-specific failure — a path separator, a rename across devices, a file that cannot be unlinked while
+open — is caught there rather than by an operator.
+
+### The Go implementation
+
+Until it is removed, the Go code builds with Go 1.27 or later and produces a single static executable:
 
 ```sh
 go build ./...   # writes ./pisquared
-./pisquared
 ```
 
-Builds and tests run on Linux, macOS, and Windows in [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
-A platform-specific failure — a path separator, a rename across devices, a file that cannot be unlinked while
-open — is caught there rather than by an operator.
+Its workflow, [`.github/workflows/ci.yml`](.github/workflows/ci.yml), is manual-only.
 
 ## The ladder
 
