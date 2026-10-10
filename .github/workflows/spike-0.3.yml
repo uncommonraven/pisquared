@@ -1,0 +1,71 @@
+# TEMPORARY: task 0.3 spike. Proves the chosen xz decoder (async-compression with
+# the xz feature, vendored liblzma) builds from a clean checkout on all three
+# platforms and that no liblzma shared library is linked. Delete once 0.3 is
+# recorded in openspec/changes/v0-1-image-download/design.md.
+name: spike-0.3
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["spike-0.3**"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Show toolchain
+        run: cargo --version && rustc --version
+
+      - name: Build release
+        run: cargo build --release
+
+      - name: Test
+        run: cargo test
+
+      - name: Check liblzma is not linked as a shared library (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          for bin in target/release/pisquared "$(find target/debug/deps -maxdepth 1 -name 'pisquared-*' -type f -perm -u+x | head -1)"; do
+            echo "== $bin"
+            ldd "$bin"
+            if ldd "$bin" | grep -qi lzma; then echo "FAIL: liblzma linked"; exit 1; fi
+          done
+
+      - name: Check liblzma is not linked as a shared library (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          for bin in target/release/pisquared "$(find target/debug/deps -maxdepth 1 -name 'pisquared-*' -type f -perm -u+x | head -1)"; do
+            echo "== $bin"
+            otool -L "$bin"
+            if otool -L "$bin" | grep -qi lzma; then echo "FAIL: liblzma linked"; exit 1; fi
+          done
+
+      - name: Set up MSVC environment (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Check liblzma is not linked as a shared library (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $bins = @("target\release\pisquared.exe") + (Get-ChildItem target\debug\deps\pisquared-*.exe | ForEach-Object { $_.FullName })
+          foreach ($bin in $bins) {
+            Write-Host "== $bin"
+            $out = dumpbin /dependents $bin | Out-String
+            Write-Host $out
+            if ($out -match '(?i)lzma') { Write-Host "FAIL: liblzma linked"; exit 1 }
+          }

@@ -1,0 +1,20 @@
+[package]
+name = "pisquared"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Obtains a verified, flashable DietPi base image for a chosen Raspberry Pi device."
+
+[dependencies]
+async-compression = { version = "0.4.50", features = ["xz", "futures-io"] }
+liblzma = { version = "0.4.8", features = ["static"] }
+
+[[bin]]
+name = "pisquared"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+
+[dev-dependencies]
+futures = "0.3"

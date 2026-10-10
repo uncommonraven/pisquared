@@ -8,4 +8,7 @@ skills-lock.json
 /pisquared
 /pisquared.exe
 
+# Build output from `cargo build`
+/target
+
 rustexperiment/*
