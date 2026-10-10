@@ -1,3 +1,6 @@
+#[cfg(test)]
+mod tui;
+
 fn main() {
     println!("pisquared {}", env!("CARGO_PKG_VERSION"));
 }

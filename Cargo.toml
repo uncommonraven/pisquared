@@ -7,7 +7,9 @@ description = "Obtains a verified, flashable DietPi base image for a chosen Rasp
 
 [dependencies]
 async-compression = { version = "0.4.50", features = ["xz", "futures-io"] }
+crossterm = "0.29.0"
 liblzma = { version = "0.4.8", features = ["static"] }
+ratatui = "0.30.2"
 
 [[bin]]
 name = "pisquared"
