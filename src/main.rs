@@ -1,4 +1,8 @@
 #[cfg(test)]
+mod catalogue;
+#[cfg(test)]
+mod check;
+#[cfg(test)]
 mod tui;
 
 fn main() {

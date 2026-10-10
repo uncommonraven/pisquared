@@ -1,6 +1,6 @@
 name: rust
 
-# Format, lint, and test the Rust crate on all three platforms. Runs on every push
+# Format, lint, and test the Rust crate. Tests run on all three platforms on every push
 # to main and on every pull request, so a Windows-only failure shows up here.
 on:
   push:
@@ -12,8 +12,29 @@ permissions:
   contents: read
 
 jobs:
+  # Formatting and lints do not depend on the platform, and they fail in seconds, so they
+  # run once on Linux rather than three times over the slowest platform.
+  lint:
+    name: format and lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # rust-toolchain.toml pins the toolchain, so rustup installs that exact
+      # version here and every platform builds with the same compiler.
+      - name: Show toolchain
+        run: cargo --version && rustc --version
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Lint
+        run: cargo clippy -- -D warnings
+
   check:
-    name: ${{ matrix.os }}
+    name: test ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
       # Run all three platforms even if one fails, so a single run shows the
@@ -24,18 +45,34 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      # rust-toolchain.toml pins the toolchain, so rustup installs that exact
-      # version here and every platform builds with the same compiler.
       - name: Show toolchain
         run: cargo --version && rustc --version
 
-      - name: Format
-        run: cargo fmt --check
-
-      - name: Lint
-        run: cargo clippy -- -D warnings
+      # Compiled dependencies, including vendored liblzma and the TLS crypto, are the slow part of a
+      # cold Windows build. Caching them keys on the lockfile and the toolchain, so unchanged
+      # dependencies are not compiled again on each run.
+      - uses: Swatinem/rust-cache@v2
 
       # The xz decoder vendors and compiles liblzma, so this also proves the C
       # toolchain on each platform can build the crate from a clean checkout.
       - name: Test
         run: cargo test
+
+  # Requests every committed image address from the publisher, so this job reaches the network and is
+  # kept apart from the platform tests. It runs once, on Linux: the check asks a remote server whether
+  # it serves a file, and running it three times would triple the requests without covering anything new.
+  catalogue-addresses:
+    name: catalogue addresses resolve
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Show toolchain
+        run: cargo --version && rustc --version
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Ignored tests are the ones that reach the publisher's servers, so a developer's `cargo test`
+      # does not fail because dietpi.com is slow. This job is where they run.
+      - name: Every committed image address resolves
+        run: cargo test -- --ignored --nocapture
