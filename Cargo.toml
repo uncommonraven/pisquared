@@ -6,10 +6,20 @@ rust-version = "1.88"
 description = "Obtains a verified, flashable DietPi base image for a chosen Raspberry Pi device."
 
 [dependencies]
+anyhow = "1.0.104"
 async-compression = { version = "0.4.50", features = ["xz", "futures-io"] }
+clap = { version = "4.6.7", features = ["derive"] }
 crossterm = "0.29.0"
 liblzma = { version = "0.4.8", features = ["static"] }
+pgp = "=0.21.0"
 ratatui = "0.30.2"
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls"] }
+sha2 = "0.10"
+tempfile = "3.27.0"
+thiserror = "2.0.21"
+tokio = { version = "1.53.2", features = ["rt-multi-thread", "macros", "fs", "io-util", "sync"] }
+tokio-util = "0.7.20"
+url = "2.5.8"
 
 [[bin]]
 name = "pisquared"
