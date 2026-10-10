@@ -7,7 +7,7 @@ description = "Obtains a verified, flashable DietPi base image for a chosen Rasp
 
 [dependencies]
 anyhow = "1.0.104"
-async-compression = { version = "0.4.50", features = ["xz", "futures-io"] }
+async-compression = { version = "0.4.50", features = ["xz", "futures-io", "tokio"] }
 clap = { version = "4.6.7", features = ["derive"] }
 crossterm = "0.29.0"
 liblzma = { version = "0.4.8", features = ["static"] }

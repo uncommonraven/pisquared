@@ -270,7 +270,7 @@ pub fn filename(address: &str) -> String {
         .unwrap_or_default()
 }
 
-fn partial_path(output: &Path) -> PathBuf {
+pub(crate) fn partial_path(output: &Path) -> PathBuf {
     let mut name = output.as_os_str().to_owned();
     name.push(PARTIAL_SUFFIX);
     PathBuf::from(name)

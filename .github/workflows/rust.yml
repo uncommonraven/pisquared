@@ -61,8 +61,10 @@ jobs:
   # Requests every committed image address from the publisher, so this job reaches the network and is
   # kept apart from the platform tests. It runs once, on Linux: the check asks a remote server whether
   # it serves a file, and running it three times would triple the requests without covering anything new.
+  # It runs only when started manually, so routine pushes and pull requests do not contact the publisher.
   catalogue-addresses:
     name: catalogue addresses resolve
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5

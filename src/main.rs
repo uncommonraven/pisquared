@@ -3,6 +3,8 @@ mod catalogue;
 #[cfg(test)]
 mod check;
 #[cfg(test)]
+mod decompress;
+#[cfg(test)]
 mod fetch;
 #[cfg(test)]
 mod signature;
