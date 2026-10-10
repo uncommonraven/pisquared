@@ -89,6 +89,10 @@ func Download(ctx context.Context, client *http.Client, imageURL, outputPath str
 	if err != nil {
 		return Result{Checksum: unverified(source, err)}, err
 	}
+	// The safety net for every path that returns before the close below: the
+	// transfer error branches need the handle released without saying so each
+	// time. Once the explicit close has run, this one only ever closes an
+	// already-closed file, which returns an error nothing reads.
 	defer file.Close()
 
 	hasher := sha256.New()
@@ -109,6 +113,18 @@ func Download(ctx context.Context, client *http.Client, imageURL, outputPath str
 	}
 
 	if err := file.Sync(); err != nil {
+		return partial(partPath, written, unverified(source, err)), err
+	}
+
+	// The handle is closed before anything renames or removes the part file
+	// below. POSIX systems allow a rename or a removal over an open file,
+	// which is why this package's tests pass on Linux and macOS unchanged,
+	// but Windows refuses both while a handle is out and answers a sharing
+	// violation — the rename of a finished download and the removal of a
+	// failed one are the two places that shows. Closing first is correct on
+	// every platform, and the hashing needed nothing from the file after the
+	// transfer: the digest was computed as the bytes went past.
+	if err := file.Close(); err != nil {
 		return partial(partPath, written, unverified(source, err)), err
 	}
 
