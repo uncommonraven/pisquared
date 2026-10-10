@@ -2400,6 +2400,7 @@ dependencies = [
  "futures",
  "liblzma",
  "pgp",
+ "rand 0.8.8",
  "ratatui",
  "reqwest",
  "sha2",

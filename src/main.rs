@@ -5,6 +5,10 @@ mod check;
 #[cfg(test)]
 mod fetch;
 #[cfg(test)]
+mod signature;
+#[cfg(test)]
+mod test_server;
+#[cfg(test)]
 mod tui;
 
 fn main() {
