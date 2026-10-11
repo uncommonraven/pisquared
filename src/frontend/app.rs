@@ -1,28 +1,48 @@
-//! The interface as a whole: choosing a device, then obtaining its image while showing progress, then the outcome.
+//! The interface as a whole: choosing a device, choosing its preferences, confirming them, then obtaining its image
+//! while showing progress, then the outcome.
 //!
-//! Before a run starts the device selection view has the screen. While a run is in progress the screen shows what
-//! it is doing and Esc or Ctrl-C cancels it. Once the run has ended the screen shows its outcome and its log, and
+//! Before a run starts the device selection view has the screen, then the preferences view once a device is chosen,
+//! then the confirmation view once the preferences are complete. Only Enter on the confirmation view starts the run,
+//! so nothing is downloaded until the operator has seen their choices. While a run is in progress the screen shows
+//! what it is doing and Esc or Ctrl-C cancels it. Once the run has ended the screen shows its outcome and its log, and
 //! Esc or Ctrl-C quits.
 
 use std::path::PathBuf;
 
-use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout};
 use ratatui::widgets::{Block, Gauge, Paragraph, Wrap};
 
+use crate::backend::catalogue::Device;
 use crate::backend::fetch::Verification;
+use crate::backend::preferences::Preferences;
 use crate::backend::run::{Activity, Job, Obtained, RunError};
-use crate::frontend::select;
+use crate::frontend::{preferences, select};
 
 pub struct Model {
     select: select::Model,
+    choosing: Option<Choosing>,
+    confirming: Option<Confirming>,
     output_dir: PathBuf,
     run: Option<Run>,
 }
 
+/// A chosen device whose preferences are being picked before its image is obtained.
+struct Choosing {
+    device: &'static Device,
+    menus: preferences::Model,
+}
+
+/// A chosen device whose complete preferences are shown for the operator to confirm before anything is downloaded.
+struct Confirming {
+    device: &'static Device,
+    menus: preferences::Model,
+    preferences: Preferences,
+}
+
 enum Run {
-    Active(Job),
+    Active { job: Job, preferences: Preferences },
     Ended { outcome: String, log: String },
 }
 
@@ -30,6 +50,8 @@ impl Model {
     pub fn new(output_dir: PathBuf) -> Self {
         Self {
             select: select::Model::default(),
+            choosing: None,
+            confirming: None,
             output_dir,
             run: None,
         }
@@ -48,19 +70,44 @@ pub fn update(model: &mut Model, event: &Event) -> bool {
         || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL));
 
     match &model.run {
-        Some(Run::Active(job)) => {
+        Some(Run::Active { job, .. }) => {
             if interrupt {
                 job.cancel();
             }
             false
         }
         Some(Run::Ended { .. }) => interrupt,
-        None if interrupt => true,
         None => {
-            if key.code == KeyCode::Enter
+            if let Some(confirming) = model.confirming.take() {
+                return confirm(model, confirming, key);
+            }
+            if interrupt {
+                return true;
+            }
+            if let Some(mut choosing) = model.choosing.take() {
+                match key.code {
+                    KeyCode::Enter => match choosing.menus.confirmed() {
+                        Some(preferences) => {
+                            model.confirming = Some(Confirming {
+                                device: choosing.device,
+                                menus: choosing.menus,
+                                preferences,
+                            });
+                        }
+                        None => model.choosing = Some(choosing),
+                    },
+                    _ => {
+                        preferences::update(&mut choosing.menus, event);
+                        model.choosing = Some(choosing);
+                    }
+                }
+            } else if key.code == KeyCode::Enter
                 && let Some(device) = model.select.chosen()
             {
-                model.run = Some(Run::Active(Job::start(device.id, model.output_dir.clone())));
+                model.choosing = Some(Choosing {
+                    device,
+                    menus: preferences::Model::default(),
+                });
             } else {
                 select::update(&mut model.select, event);
             }
@@ -69,9 +116,33 @@ pub fn update(model: &mut Model, event: &Event) -> bool {
     }
 }
 
+/// Applies a key on the confirmation view: Enter starts the run, Esc returns to the preferences with their choices
+/// kept, and Ctrl-C quits. Any other key leaves the confirmation as it is.
+fn confirm(model: &mut Model, confirming: Confirming, key: &KeyEvent) -> bool {
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        return true;
+    }
+    match key.code {
+        KeyCode::Enter => {
+            model.run = Some(Run::Active {
+                job: Job::start(confirming.device.id, model.output_dir.clone()),
+                preferences: confirming.preferences,
+            });
+        }
+        KeyCode::Esc => {
+            model.choosing = Some(Choosing {
+                device: confirming.device,
+                menus: confirming.menus,
+            });
+        }
+        _ => model.confirming = Some(confirming),
+    }
+    false
+}
+
 /// Takes in what an active run has reported, and moves to its outcome once the run has ended.
 pub fn tick(model: &mut Model) {
-    let Some(Run::Active(job)) = &mut model.run else {
+    let Some(Run::Active { job, .. }) = &mut model.run else {
         return;
     };
     if let Some((result, log)) = job.poll() {
@@ -84,8 +155,12 @@ pub fn tick(model: &mut Model) {
 
 pub fn view(model: &Model, frame: &mut Frame) {
     match &model.run {
-        None => select::view(&model.select, frame),
-        Some(Run::Active(job)) => view_active(job.current(), frame),
+        None => match (&model.confirming, &model.choosing) {
+            (Some(confirming), _) => view_confirming(confirming, frame),
+            (None, Some(choosing)) => preferences::view(&choosing.menus, frame),
+            (None, None) => select::view(&model.select, frame),
+        },
+        Some(Run::Active { job, preferences }) => view_active(job.current(), preferences, frame),
         Some(Run::Ended { outcome, log }) => view_ended(outcome, log, frame),
     }
 }
@@ -113,8 +188,9 @@ fn checksum_outcome(verification: &Verification) -> String {
     }
 }
 
-fn view_active(activity: Activity, frame: &mut Frame) {
-    let [status_area, progress_area, hint_area] = Layout::vertical([
+fn view_active(activity: Activity, preferences: &Preferences, frame: &mut Frame) {
+    let [status_area, progress_area, preferences_area, hint_area] = Layout::vertical([
+        Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Length(1),
@@ -126,11 +202,37 @@ fn view_active(activity: Activity, frame: &mut Frame) {
         Gauge::default().ratio(ratio(activity)).label(""),
         progress_area,
     );
+    frame.render_widget(Paragraph::new(preferences.to_string()), preferences_area);
     frame.render_widget(
         Paragraph::new(
             "Press Esc or Ctrl-C to cancel. A cancelled run leaves nothing that looks finished.",
         ),
         hint_area,
+    );
+}
+
+fn view_confirming(confirming: &Confirming, frame: &mut Frame) {
+    let device = confirming.device;
+    let mut lines = vec![
+        "Confirm your choices. Nothing has been downloaded yet.".to_owned(),
+        format!("Device: {}", device.name),
+        format!("Image: {}", device.image_name()),
+        format!("Address: {}", device.address()),
+    ];
+    lines.extend(
+        device
+            .caveats
+            .iter()
+            .map(|caveat| format!("Caveat: {caveat}")),
+    );
+    lines.push(format!("Preferences: {}", confirming.preferences));
+    lines.push(
+        "Press Enter to download and verify the image. Esc goes back to change your choices. Ctrl-C quits.".to_owned(),
+    );
+
+    frame.render_widget(
+        Paragraph::new(lines.join("\n")).wrap(Wrap { trim: true }),
+        frame.area(),
     );
 }
 
@@ -189,7 +291,10 @@ fn mebibytes(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::preferences::Harness;
     use crossterm::event::{KeyEvent, KeyModifiers};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> Event {
         Event::Key(KeyEvent::new(code, modifiers))
@@ -251,6 +356,101 @@ mod tests {
             digest: "00".to_owned(),
         });
         assert!(verified.contains("matches"), "{verified}");
+    }
+
+    #[test]
+    fn a_chosen_device_opens_its_preferences_and_an_incomplete_choice_starts_nothing() {
+        let mut model = Model::new(PathBuf::from("."));
+        update(&mut model, &key(KeyCode::Enter, KeyModifiers::NONE));
+        update(&mut model, &key(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(model.choosing.is_some(), "the preferences screen is shown");
+        assert!(model.run.is_none());
+
+        update(&mut model, &key(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(
+            model.choosing.is_some(),
+            "the preferences are not yet complete"
+        );
+        assert!(model.run.is_none());
+    }
+
+    #[test]
+    fn complete_preferences_show_a_confirmation_that_starts_nothing() {
+        let mut model = Model::new(PathBuf::from("."));
+        update(&mut model, &key(KeyCode::Enter, KeyModifiers::NONE));
+        update(&mut model, &key(KeyCode::Enter, KeyModifiers::NONE));
+        update(&mut model, &key(KeyCode::Char(' '), KeyModifiers::NONE));
+        update(&mut model, &key(KeyCode::Tab, KeyModifiers::NONE));
+        update(&mut model, &key(KeyCode::Char(' '), KeyModifiers::NONE));
+        update(&mut model, &key(KeyCode::Tab, KeyModifiers::NONE));
+        update(&mut model, &key(KeyCode::Char(' '), KeyModifiers::NONE));
+        update(&mut model, &key(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(model.confirming.is_some(), "the confirmation is shown");
+        assert!(model.choosing.is_none());
+        assert!(model.run.is_none(), "confirming starts nothing");
+    }
+
+    #[test]
+    fn escape_on_the_confirmation_returns_to_the_preferences_and_keeps_them() {
+        let mut model = Model::new(PathBuf::from("."));
+        update(&mut model, &key(KeyCode::Enter, KeyModifiers::NONE));
+        update(&mut model, &key(KeyCode::Enter, KeyModifiers::NONE));
+        update(&mut model, &key(KeyCode::Char(' '), KeyModifiers::NONE));
+        update(&mut model, &key(KeyCode::Tab, KeyModifiers::NONE));
+        update(&mut model, &key(KeyCode::Char(' '), KeyModifiers::NONE));
+        update(&mut model, &key(KeyCode::Tab, KeyModifiers::NONE));
+        update(&mut model, &key(KeyCode::Char(' '), KeyModifiers::NONE));
+        update(&mut model, &key(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(!update(&mut model, &key(KeyCode::Esc, KeyModifiers::NONE)));
+
+        assert!(model.confirming.is_none());
+        let choosing = model.choosing.as_ref().expect("back on the preferences");
+        assert_eq!(
+            choosing.menus.confirmed().map(|p| p.harnesses),
+            Some(vec![Harness::Pi])
+        );
+        assert!(model.run.is_none());
+    }
+
+    #[test]
+    fn the_confirmation_shows_the_choices_before_the_download() {
+        let mut model = Model::new(PathBuf::from("."));
+        update(&mut model, &key(KeyCode::Enter, KeyModifiers::NONE));
+        update(&mut model, &key(KeyCode::Enter, KeyModifiers::NONE));
+        update(&mut model, &key(KeyCode::Char(' '), KeyModifiers::NONE));
+        update(&mut model, &key(KeyCode::Tab, KeyModifiers::NONE));
+        update(&mut model, &key(KeyCode::Char(' '), KeyModifiers::NONE));
+        update(&mut model, &key(KeyCode::Tab, KeyModifiers::NONE));
+        update(&mut model, &key(KeyCode::Char(' '), KeyModifiers::NONE));
+        update(&mut model, &key(KeyCode::Enter, KeyModifiers::NONE));
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 20)).unwrap();
+        terminal.draw(|frame| view(&model, frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let rendered: String = (0..20)
+            .map(|y| {
+                (0..120)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let rendered = rendered.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        assert!(
+            rendered.contains("Nothing has been downloaded yet."),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "Preferences: Orchestrator: herdr. Harnesses: pi agent. Sandboxes: nono."
+            ),
+            "{rendered}"
+        );
     }
 
     #[test]

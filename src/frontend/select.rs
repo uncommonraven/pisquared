@@ -110,7 +110,7 @@ fn detail(model: &Model) -> String {
 
     let status = match model.chosen() {
         Some(chosen) => format!(
-            "Chosen: {}. Nothing has been fetched. Press Enter again to start the download.",
+            "Chosen: {}. Nothing has been fetched. Press Enter again to choose its preferences.",
             chosen.name
         ),
         None => "Press Enter to choose this device. Choosing fetches nothing.".to_owned(),
