@@ -142,12 +142,17 @@ async fn stream_to(
     Ok(written)
 }
 
-/// The reason a decode failed. When the xz data ends before the stream is complete, liblzma returns a buffer error
-/// (`LZMA_BUF_ERROR`). The xz decoder in `compression-codecs` (`src/xz2/mod.rs`) reports that status as
-/// `io::ErrorKind::OutOfMemory`, so that kind is read as truncation. A genuine allocation failure would arrive as
-/// the same kind and be reported as truncation too, which is why the truncated case is the one the tests pin.
+/// The reason a decode failed. When the xz data ends before the stream is complete, the decoder reports it in one of
+/// two ways, depending on where the input runs out. liblzma returns a buffer error (`LZMA_BUF_ERROR`), which the xz
+/// decoder in `compression-codecs` reports as `io::ErrorKind::OutOfMemory`. Or async-compression's own flush reports
+/// `io::ErrorKind::UnexpectedEof` when the input ends first. Both mean the same thing here, since the input is a file
+/// and nothing else can end it early, so both are read as truncation. A genuine allocation failure would arrive as
+/// `OutOfMemory` and be reported as truncation too, which is why the truncated case is the one the tests pin.
 fn stream_reason(err: &io::Error) -> String {
-    if err.kind() == io::ErrorKind::OutOfMemory {
+    if matches!(
+        err.kind(),
+        io::ErrorKind::OutOfMemory | io::ErrorKind::UnexpectedEof
+    ) {
         "the xz data ends before the stream is complete, so the image is truncated".to_owned()
     } else {
         err.to_string()
@@ -201,6 +206,15 @@ mod tests {
         assert!(err.to_string().contains("truncated"), "{err}");
         assert!(!output.exists());
         assert!(!partial_path(&output).exists());
+    }
+
+    /// Both ways the decoder reports a stream that ends early read as truncation, whichever one a platform produces.
+    #[test]
+    fn an_early_end_of_input_reads_as_truncation() {
+        for kind in [io::ErrorKind::OutOfMemory, io::ErrorKind::UnexpectedEof] {
+            let reason = stream_reason(&io::Error::from(kind));
+            assert!(reason.contains("truncated"), "{kind:?}: {reason}");
+        }
     }
 
     /// A stream with corrupted bytes fails with the reason shown, and nothing is left at either name.
