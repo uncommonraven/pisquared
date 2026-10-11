@@ -1,8 +1,9 @@
-//! The preferences screen: three menus, for the orchestrator, the harnesses, and the sandboxes.
+//! The preferences screens: one menu each for the orchestrator, the harnesses, and the sandboxes.
 //!
-//! Tab moves between the menus. Up and down move the cursor within the focused menu, Space picks the option under it,
-//! and Enter continues once every menu has a choice. The orchestrator takes one choice; a harness or a sandbox may take
-//! several. The options and the summary are the backend's; this view holds only the cursor and what is picked.
+//! Each menu has a screen of its own. Up and down move the cursor, and Space picks the option under it. Enter continues
+//! once the screen has a pick, moving on to the next screen, and from the last screen to the confirmation once every
+//! menu has a choice. Left goes back to the previous screen. The orchestrator takes one choice; a harness or a sandbox
+//! may take several. The options and the summary are the backend's; this view holds only the cursor and what is picked.
 
 use crossterm::event::{Event, KeyCode, KeyEventKind};
 use ratatui::Frame;
@@ -13,7 +14,7 @@ use ratatui::widgets::{Block, List, ListState, Paragraph, Wrap};
 use crate::backend::preferences::{Choice, Harness, Orchestrator, Preferences, Sandbox};
 
 pub struct Model {
-    focus: Focus,
+    screen: Screen,
     orchestrator: Menu<Orchestrator>,
     harnesses: Menu<Harness>,
     sandboxes: Menu<Sandbox>,
@@ -22,10 +23,10 @@ pub struct Model {
 impl Default for Model {
     fn default() -> Self {
         Self {
-            focus: Focus::Orchestrator,
+            screen: Screen::Orchestrator,
             orchestrator: Menu::new(false),
             harnesses: Menu::new(true),
-            sandboxes: Menu::new(true),
+            sandboxes: Menu::new(false),
         }
     }
 }
@@ -46,51 +47,86 @@ impl Model {
         })
     }
 
-    /// The menus still without a choice, by name.
-    fn missing(&self) -> Vec<&'static str> {
-        let mut missing = Vec::new();
-        if self.orchestrator.chosen().is_empty() {
-            missing.push("orchestrator");
+    /// Continues from the current screen once it has a pick. From the last screen it returns the preferences, if every
+    /// menu has a choice.
+    pub fn enter(&mut self) -> Option<Preferences> {
+        if !self.current().picked() {
+            return None;
         }
-        if self.harnesses.chosen().is_empty() {
-            missing.push("harness");
+        match self.screen.next() {
+            Some(next) => {
+                self.screen = next;
+                None
+            }
+            None => self.confirmed(),
         }
-        if self.sandboxes.chosen().is_empty() {
-            missing.push("sandbox");
-        }
-        missing
     }
 
-    fn focused(&mut self) -> &mut dyn Pick {
-        match self.focus {
-            Focus::Orchestrator => &mut self.orchestrator,
-            Focus::Harnesses => &mut self.harnesses,
-            Focus::Sandboxes => &mut self.sandboxes,
+    /// Goes back to the previous screen. Reports false on the first screen, where going back leaves the preferences.
+    pub fn back(&mut self) -> bool {
+        match self.screen.previous() {
+            Some(previous) => {
+                self.screen = previous;
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn current(&self) -> &dyn Pick {
+        match self.screen {
+            Screen::Orchestrator => &self.orchestrator,
+            Screen::Harnesses => &self.harnesses,
+            Screen::Sandboxes => &self.sandboxes,
+        }
+    }
+
+    fn current_mut(&mut self) -> &mut dyn Pick {
+        match self.screen {
+            Screen::Orchestrator => &mut self.orchestrator,
+            Screen::Harnesses => &mut self.harnesses,
+            Screen::Sandboxes => &mut self.sandboxes,
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Focus {
+enum Screen {
     Orchestrator,
     Harnesses,
     Sandboxes,
 }
 
-impl Focus {
-    fn next(self) -> Self {
+impl Screen {
+    fn next(self) -> Option<Self> {
         match self {
-            Self::Orchestrator => Self::Harnesses,
-            Self::Harnesses => Self::Sandboxes,
-            Self::Sandboxes => Self::Orchestrator,
+            Self::Orchestrator => Some(Self::Harnesses),
+            Self::Harnesses => Some(Self::Sandboxes),
+            Self::Sandboxes => None,
         }
     }
 
-    fn previous(self) -> Self {
+    fn previous(self) -> Option<Self> {
         match self {
-            Self::Orchestrator => Self::Sandboxes,
-            Self::Harnesses => Self::Orchestrator,
-            Self::Sandboxes => Self::Harnesses,
+            Self::Orchestrator => None,
+            Self::Harnesses => Some(Self::Orchestrator),
+            Self::Sandboxes => Some(Self::Harnesses),
+        }
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            Self::Orchestrator => "Orchestrator (choose one)",
+            Self::Harnesses => "Harnesses (choose one or more)",
+            Self::Sandboxes => "Sandboxes (choose one)",
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Orchestrator => "the orchestrator",
+            Self::Harnesses => "the harnesses",
+            Self::Sandboxes => "the sandboxes",
         }
     }
 }
@@ -121,11 +157,13 @@ impl<T: Choice> Menu<T> {
     }
 }
 
-/// What the focused menu does with a key. Lets the view work on any menu without knowing its option type.
+/// What the current menu does with a key. Lets the view work on any menu without knowing its option type.
 trait Pick {
     fn move_cursor(&mut self, by: isize);
 
     fn toggle(&mut self);
+
+    fn picked(&self) -> bool;
 }
 
 impl<T: Choice> Pick for Menu<T> {
@@ -136,18 +174,24 @@ impl<T: Choice> Pick for Menu<T> {
 
     fn toggle(&mut self) {
         let choice = T::ALL[self.cursor];
-        if let Some(index) = self.chosen.iter().position(|pick| *pick == choice) {
-            self.chosen.remove(index);
-        } else {
-            if !self.multiple {
-                self.chosen.clear();
+        if self.multiple {
+            if let Some(index) = self.chosen.iter().position(|pick| *pick == choice) {
+                self.chosen.remove(index);
+            } else {
+                self.chosen.push(choice);
             }
+        } else if !self.chosen.contains(&choice) {
+            self.chosen.clear();
             self.chosen.push(choice);
         }
     }
+
+    fn picked(&self) -> bool {
+        !self.chosen.is_empty()
+    }
 }
 
-/// Applies a terminal event: Tab moves the focus, and the arrow keys and Space act on the focused menu.
+/// Applies a terminal event: the arrow keys and Space act on the current menu.
 pub fn update(model: &mut Model, event: &Event) {
     let Event::Key(key) = event else {
         return;
@@ -156,42 +200,24 @@ pub fn update(model: &mut Model, event: &Event) {
         return;
     }
     match key.code {
-        KeyCode::Tab => model.focus = model.focus.next(),
-        KeyCode::BackTab => model.focus = model.focus.previous(),
-        KeyCode::Up => model.focused().move_cursor(-1),
-        KeyCode::Down => model.focused().move_cursor(1),
-        KeyCode::Char(' ') => model.focused().toggle(),
+        KeyCode::Up => model.current_mut().move_cursor(-1),
+        KeyCode::Down => model.current_mut().move_cursor(1),
+        KeyCode::Char(' ') => model.current_mut().toggle(),
         _ => {}
     }
 }
 
 pub fn view(model: &Model, frame: &mut Frame) {
-    let [menus_area, footer_area] =
+    let [menu_area, footer_area] =
         Layout::vertical([Constraint::Fill(1), Constraint::Length(3)]).areas(frame.area());
-    let [orchestrator_area, harnesses_area, sandboxes_area] =
-        Layout::horizontal([Constraint::Fill(1); 3]).areas(menus_area);
 
-    render_menu(
-        frame,
-        orchestrator_area,
-        &model.orchestrator,
-        "Orchestrator (choose one)",
-        model.focus == Focus::Orchestrator,
-    );
-    render_menu(
-        frame,
-        harnesses_area,
-        &model.harnesses,
-        "Harnesses (choose one or more)",
-        model.focus == Focus::Harnesses,
-    );
-    render_menu(
-        frame,
-        sandboxes_area,
-        &model.sandboxes,
-        "Sandboxes (choose one or more)",
-        model.focus == Focus::Sandboxes,
-    );
+    match model.screen {
+        Screen::Orchestrator => {
+            render_menu(frame, menu_area, &model.orchestrator, model.screen.title())
+        }
+        Screen::Harnesses => render_menu(frame, menu_area, &model.harnesses, model.screen.title()),
+        Screen::Sandboxes => render_menu(frame, menu_area, &model.sandboxes, model.screen.title()),
+    }
 
     frame.render_widget(
         Paragraph::new(footer(model)).wrap(Wrap { trim: true }),
@@ -199,48 +225,43 @@ pub fn view(model: &Model, frame: &mut Frame) {
     );
 }
 
-fn render_menu<T: Choice>(
-    frame: &mut Frame,
-    area: Rect,
-    menu: &Menu<T>,
-    title: &str,
-    focused: bool,
-) {
+fn render_menu<T: Choice>(frame: &mut Frame, area: Rect, menu: &Menu<T>, title: &str) {
     let items: Vec<String> = T::ALL
         .iter()
         .map(|choice| {
-            let mark = if menu.chosen.contains(choice) {
-                "[x]"
-            } else {
-                "[ ]"
+            let picked = menu.chosen.contains(choice);
+            let mark = match (menu.multiple, picked) {
+                (true, true) => "[x]",
+                (true, false) => "[ ]",
+                (false, true) => "(•)",
+                (false, false) => "( )",
             };
             format!("{mark} {}", choice.name())
         })
         .collect();
-    let border = if focused {
-        Style::new().bold()
-    } else {
-        Style::new()
-    };
-    let mut list = List::new(items).block(Block::bordered().title(title).border_style(border));
-    if focused {
-        list = list
-            .highlight_style(Style::new().reversed())
-            .highlight_symbol("> ");
-    }
+    let list = List::new(items)
+        .block(
+            Block::bordered()
+                .title(title)
+                .border_style(Style::new().bold()),
+        )
+        .highlight_style(Style::new().reversed())
+        .highlight_symbol("> ");
     let mut state = ListState::default();
     state.select(Some(menu.cursor));
     frame.render_stateful_widget(list, area, &mut state);
 }
 
 fn footer(model: &Model) -> String {
-    let status = match model.missing().as_slice() {
-        [] => "Enter continues to confirm your choices.".to_owned(),
-        missing => format!("Still to choose: {}.", missing.join(", ")),
+    let status = if !model.current().picked() {
+        "Pick an option to continue.".to_owned()
+    } else {
+        match model.screen.next() {
+            Some(next) => format!("Enter continues to {}.", next.name()),
+            None => "Enter continues to confirm your choices.".to_owned(),
+        }
     };
-    format!(
-        "{status}\nTab moves between menus. Up and down move, Space picks, Enter continues. Esc quits."
-    )
+    format!("{status}\nUp and down move, Space picks, Enter continues. Left goes back. Esc quits.")
 }
 
 #[cfg(test)]
@@ -276,26 +297,28 @@ mod tests {
         text.split_whitespace().collect::<Vec<_>>().join(" ")
     }
 
-    /// Picks the option under the cursor of the focused menu.
+    /// Picks the option under the cursor of the current menu.
     fn pick(model: &mut Model) {
         update(model, &key(KeyCode::Char(' ')));
     }
 
     #[test]
-    fn nothing_is_confirmed_until_every_menu_has_a_choice() {
+    fn enter_moves_through_the_screens_and_confirms_only_after_the_last() {
         let mut model = Model::default();
-        assert_eq!(model.missing(), ["orchestrator", "harness", "sandbox"]);
+        assert_eq!(model.enter(), None, "nothing is picked, so nothing moves");
+        assert_eq!(model.screen, Screen::Orchestrator);
 
         pick(&mut model);
-        update(&mut model, &key(KeyCode::Tab));
-        pick(&mut model);
-        assert!(model.confirmed().is_none());
-        assert_eq!(model.missing(), ["sandbox"]);
+        assert_eq!(model.enter(), None);
+        assert_eq!(model.screen, Screen::Harnesses);
 
-        update(&mut model, &key(KeyCode::Tab));
+        pick(&mut model);
+        assert_eq!(model.enter(), None);
+        assert_eq!(model.screen, Screen::Sandboxes);
+
         pick(&mut model);
         assert_eq!(
-            model.confirmed(),
+            model.enter(),
             Some(Preferences {
                 orchestrator: Orchestrator::Herdr,
                 harnesses: vec![Harness::Pi],
@@ -305,9 +328,22 @@ mod tests {
     }
 
     #[test]
+    fn back_returns_to_the_previous_screen_and_keeps_the_picks() {
+        let mut model = Model::default();
+        pick(&mut model);
+        model.enter();
+
+        assert!(model.back());
+        assert_eq!(model.screen, Screen::Orchestrator);
+        assert_eq!(model.orchestrator.chosen(), [Orchestrator::Herdr]);
+        assert!(!model.back(), "the first screen has no previous screen");
+    }
+
+    #[test]
     fn a_harness_menu_takes_several_choices_and_space_removes_one() {
         let mut model = Model::default();
-        update(&mut model, &key(KeyCode::Tab));
+        pick(&mut model);
+        model.enter();
         pick(&mut model);
         update(&mut model, &key(KeyCode::Down));
         pick(&mut model);
@@ -328,6 +364,21 @@ mod tests {
     }
 
     #[test]
+    fn a_single_choice_menu_stays_on_its_pick_when_space_is_pressed_again() {
+        let mut model = Model::default();
+        pick(&mut model);
+        model.enter();
+        pick(&mut model);
+        model.enter();
+        assert_eq!(model.screen, Screen::Sandboxes);
+
+        pick(&mut model);
+        pick(&mut model);
+
+        assert_eq!(model.sandboxes.chosen(), [Sandbox::Nono]);
+    }
+
+    #[test]
     fn a_single_choice_menu_keeps_only_the_latest_pick() {
         let mut menu = Menu::<Harness>::new(false);
         menu.toggle();
@@ -340,32 +391,39 @@ mod tests {
     #[test]
     fn the_cursor_stops_at_the_ends_of_its_menu() {
         let mut model = Model::default();
-        update(&mut model, &key(KeyCode::Tab));
+        pick(&mut model);
+        model.enter();
         for _ in 0..10 {
             update(&mut model, &key(KeyCode::Down));
         }
         pick(&mut model);
         assert_eq!(model.harnesses.chosen(), [Harness::ClaudeCode]);
 
-        update(&mut model, &key(KeyCode::BackTab));
+        model.back();
         update(&mut model, &key(KeyCode::Up));
         assert_eq!(model.orchestrator.cursor, 0);
     }
 
     #[test]
-    fn the_rendered_screen_marks_each_pick_and_names_what_is_missing() {
+    fn each_screen_shows_only_its_own_menu() {
         let mut model = Model::default();
-        pick(&mut model);
-        update(&mut model, &key(KeyCode::Tab));
-        update(&mut model, &key(KeyCode::Down));
         pick(&mut model);
 
         let rendered = words(&screen(&model));
+        assert!(rendered.contains("(•) herdr"), "{rendered}");
+        assert!(!rendered.contains("pi agent"), "{rendered}");
+        assert!(
+            rendered.contains("Enter continues to the harnesses."),
+            "{rendered}"
+        );
 
-        assert!(rendered.contains("[x] herdr"), "{rendered}");
-        assert!(rendered.contains("[x] opencode"), "{rendered}");
+        model.enter();
+        let rendered = words(&screen(&model));
         assert!(rendered.contains("[ ] pi agent"), "{rendered}");
-        assert!(rendered.contains("[ ] nono"), "{rendered}");
-        assert!(rendered.contains("Still to choose: sandbox."), "{rendered}");
+        assert!(!rendered.contains("herdr"), "{rendered}");
+        assert!(
+            rendered.contains("Pick an option to continue."),
+            "{rendered}"
+        );
     }
 }

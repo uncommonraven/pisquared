@@ -86,7 +86,7 @@ pub fn update(model: &mut Model, event: &Event) -> bool {
             }
             if let Some(mut choosing) = model.choosing.take() {
                 match key.code {
-                    KeyCode::Enter => match choosing.menus.confirmed() {
+                    KeyCode::Enter => match choosing.menus.enter() {
                         Some(preferences) => {
                             model.confirming = Some(Confirming {
                                 device: choosing.device,
@@ -96,6 +96,11 @@ pub fn update(model: &mut Model, event: &Event) -> bool {
                         }
                         None => model.choosing = Some(choosing),
                     },
+                    KeyCode::Left => {
+                        if choosing.menus.back() {
+                            model.choosing = Some(choosing);
+                        }
+                    }
                     _ => {
                         preferences::update(&mut choosing.menus, event);
                         model.choosing = Some(choosing);
@@ -129,7 +134,7 @@ fn confirm(model: &mut Model, confirming: Confirming, key: &KeyEvent) -> bool {
                 preferences: confirming.preferences,
             });
         }
-        KeyCode::Esc => {
+        KeyCode::Esc | KeyCode::Left => {
             model.choosing = Some(Choosing {
                 device: confirming.device,
                 menus: confirming.menus,
@@ -227,7 +232,7 @@ fn view_confirming(confirming: &Confirming, frame: &mut Frame) {
     );
     lines.push(format!("Preferences: {}", confirming.preferences));
     lines.push(
-        "Press Enter to download and verify the image. Esc goes back to change your choices. Ctrl-C quits.".to_owned(),
+        "Press Enter to download and verify the image. Esc or Left goes back to change your choices. Ctrl-C quits.".to_owned(),
     );
 
     frame.render_widget(
@@ -321,15 +326,36 @@ mod tests {
     }
 
     #[test]
-    fn enter_chooses_a_device_without_starting_it_and_escape_quits() {
+    fn space_picks_a_device_and_enter_continues_without_starting_it() {
+        let mut model = Model::new(PathBuf::from("."));
+
+        assert!(!update(
+            &mut model,
+            &key(KeyCode::Char(' '), KeyModifiers::NONE)
+        ));
+        assert!(model.select.chosen().is_some());
+        assert!(model.choosing.is_none(), "picking a device moves nothing");
+
+        assert!(!update(
+            &mut model,
+            &key(KeyCode::Enter, KeyModifiers::NONE)
+        ));
+        assert!(
+            model.choosing.is_some(),
+            "Enter continues to the preferences"
+        );
+        assert!(model.run.is_none(), "choosing a device starts nothing");
+    }
+
+    #[test]
+    fn enter_without_a_pick_does_nothing_and_escape_quits() {
         let mut model = Model::new(PathBuf::from("."));
 
         assert!(!update(
             &mut model,
             &key(KeyCode::Enter, KeyModifiers::NONE)
         ));
-        assert!(model.run.is_none(), "choosing a device starts nothing");
-        assert!(model.select.chosen().is_some());
+        assert!(model.choosing.is_none());
 
         assert!(update(&mut model, &key(KeyCode::Esc, KeyModifiers::NONE)));
     }
@@ -361,6 +387,7 @@ mod tests {
     #[test]
     fn a_chosen_device_opens_its_preferences_and_an_incomplete_choice_starts_nothing() {
         let mut model = Model::new(PathBuf::from("."));
+        update(&mut model, &key(KeyCode::Char(' '), KeyModifiers::NONE));
         update(&mut model, &key(KeyCode::Enter, KeyModifiers::NONE));
         update(&mut model, &key(KeyCode::Enter, KeyModifiers::NONE));
 
@@ -379,12 +406,13 @@ mod tests {
     #[test]
     fn complete_preferences_show_a_confirmation_that_starts_nothing() {
         let mut model = Model::new(PathBuf::from("."));
+        update(&mut model, &key(KeyCode::Char(' '), KeyModifiers::NONE));
         update(&mut model, &key(KeyCode::Enter, KeyModifiers::NONE));
         update(&mut model, &key(KeyCode::Enter, KeyModifiers::NONE));
         update(&mut model, &key(KeyCode::Char(' '), KeyModifiers::NONE));
-        update(&mut model, &key(KeyCode::Tab, KeyModifiers::NONE));
+        update(&mut model, &key(KeyCode::Enter, KeyModifiers::NONE));
         update(&mut model, &key(KeyCode::Char(' '), KeyModifiers::NONE));
-        update(&mut model, &key(KeyCode::Tab, KeyModifiers::NONE));
+        update(&mut model, &key(KeyCode::Enter, KeyModifiers::NONE));
         update(&mut model, &key(KeyCode::Char(' '), KeyModifiers::NONE));
         update(&mut model, &key(KeyCode::Enter, KeyModifiers::NONE));
 
@@ -396,12 +424,13 @@ mod tests {
     #[test]
     fn escape_on_the_confirmation_returns_to_the_preferences_and_keeps_them() {
         let mut model = Model::new(PathBuf::from("."));
+        update(&mut model, &key(KeyCode::Char(' '), KeyModifiers::NONE));
         update(&mut model, &key(KeyCode::Enter, KeyModifiers::NONE));
         update(&mut model, &key(KeyCode::Enter, KeyModifiers::NONE));
         update(&mut model, &key(KeyCode::Char(' '), KeyModifiers::NONE));
-        update(&mut model, &key(KeyCode::Tab, KeyModifiers::NONE));
+        update(&mut model, &key(KeyCode::Enter, KeyModifiers::NONE));
         update(&mut model, &key(KeyCode::Char(' '), KeyModifiers::NONE));
-        update(&mut model, &key(KeyCode::Tab, KeyModifiers::NONE));
+        update(&mut model, &key(KeyCode::Enter, KeyModifiers::NONE));
         update(&mut model, &key(KeyCode::Char(' '), KeyModifiers::NONE));
         update(&mut model, &key(KeyCode::Enter, KeyModifiers::NONE));
 
@@ -419,12 +448,13 @@ mod tests {
     #[test]
     fn the_confirmation_shows_the_choices_before_the_download() {
         let mut model = Model::new(PathBuf::from("."));
+        update(&mut model, &key(KeyCode::Char(' '), KeyModifiers::NONE));
         update(&mut model, &key(KeyCode::Enter, KeyModifiers::NONE));
         update(&mut model, &key(KeyCode::Enter, KeyModifiers::NONE));
         update(&mut model, &key(KeyCode::Char(' '), KeyModifiers::NONE));
-        update(&mut model, &key(KeyCode::Tab, KeyModifiers::NONE));
+        update(&mut model, &key(KeyCode::Enter, KeyModifiers::NONE));
         update(&mut model, &key(KeyCode::Char(' '), KeyModifiers::NONE));
-        update(&mut model, &key(KeyCode::Tab, KeyModifiers::NONE));
+        update(&mut model, &key(KeyCode::Enter, KeyModifiers::NONE));
         update(&mut model, &key(KeyCode::Char(' '), KeyModifiers::NONE));
         update(&mut model, &key(KeyCode::Enter, KeyModifiers::NONE));
 
@@ -451,6 +481,35 @@ mod tests {
             ),
             "{rendered}"
         );
+    }
+
+    #[test]
+    fn left_goes_back_a_stage_from_the_preferences_and_the_confirmation() {
+        let mut model = Model::new(PathBuf::from("."));
+        update(&mut model, &key(KeyCode::Char(' '), KeyModifiers::NONE));
+        update(&mut model, &key(KeyCode::Enter, KeyModifiers::NONE));
+        update(&mut model, &key(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(!update(&mut model, &key(KeyCode::Left, KeyModifiers::NONE)));
+        assert!(model.choosing.is_none(), "back on the device selection");
+        assert!(
+            model.select.chosen().is_some(),
+            "the device is still chosen"
+        );
+
+        update(&mut model, &key(KeyCode::Enter, KeyModifiers::NONE));
+        update(&mut model, &key(KeyCode::Char(' '), KeyModifiers::NONE));
+        update(&mut model, &key(KeyCode::Enter, KeyModifiers::NONE));
+        update(&mut model, &key(KeyCode::Char(' '), KeyModifiers::NONE));
+        update(&mut model, &key(KeyCode::Enter, KeyModifiers::NONE));
+        update(&mut model, &key(KeyCode::Char(' '), KeyModifiers::NONE));
+        update(&mut model, &key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(model.confirming.is_some());
+
+        update(&mut model, &key(KeyCode::Left, KeyModifiers::NONE));
+        assert!(model.confirming.is_none());
+        assert!(model.choosing.is_some(), "back on the preferences");
+        assert!(model.run.is_none());
     }
 
     #[test]
