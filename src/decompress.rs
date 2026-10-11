@@ -13,6 +13,7 @@ use async_compression::tokio::bufread::XzDecoder;
 use thiserror::Error;
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio_util::sync::CancellationToken;
 
 use crate::fetch::partial_path;
 
@@ -20,15 +21,17 @@ use crate::fetch::partial_path;
 /// does not grow with the image.
 const BUFFER_SIZE: usize = 1024 * 1024;
 
-/// A completed decompression: where the flashable file is and how many bytes it holds.
+/// A completed decompression: how many bytes the flashable file holds.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Decompression {
-    pub path: PathBuf,
     pub bytes: u64,
 }
 
 #[derive(Debug, Error)]
 pub enum DecompressError {
+    #[error("{file} was not decompressed: the run was cancelled")]
+    Cancelled { file: String },
+
     #[error("{file} did not decompress: {reason}")]
     Stream { file: String, reason: String },
 
@@ -41,10 +44,15 @@ pub enum DecompressError {
 }
 
 /// Decompresses the xz file at `input` to `output`. The output appears only if the whole stream decompressed; any
-/// failure removes the partial file, so nothing is presented as a flashable image.
-pub async fn decompress(input: &Path, output: &Path) -> Result<Decompression, DecompressError> {
+/// failure removes the partial file, so nothing is presented as a flashable image. A cancellation counts as a
+/// failure here: the decode stops and the partial file is removed.
+pub async fn decompress(
+    input: &Path,
+    output: &Path,
+    cancel: &CancellationToken,
+) -> Result<Decompression, DecompressError> {
     let partial = partial_path(output);
-    match stream_to(input, &partial).await {
+    match stream_to(input, &partial, cancel).await {
         Ok(bytes) => {
             tokio::fs::rename(&partial, output)
                 .await
@@ -52,10 +60,7 @@ pub async fn decompress(input: &Path, output: &Path) -> Result<Decompression, De
                     path: output.to_path_buf(),
                     source,
                 })?;
-            Ok(Decompression {
-                path: output.to_path_buf(),
-                bytes,
-            })
+            Ok(Decompression { bytes })
         }
         Err(err) => {
             let _ = tokio::fs::remove_file(&partial).await;
@@ -65,13 +70,28 @@ pub async fn decompress(input: &Path, output: &Path) -> Result<Decompression, De
 }
 
 /// Decodes `input` into `partial`, returning how many bytes were written.
-async fn stream_to(input: &Path, partial: &Path) -> Result<u64, DecompressError> {
-    let source = File::open(input)
-        .await
-        .map_err(|source| DecompressError::Io {
-            path: input.to_path_buf(),
-            source,
-        })?;
+///
+/// Every read is raced against the cancellation token, as the 0.4 spike proved the decode can be, and the
+/// token is checked once more after the stream ends so a cancel that lands during the last read still counts.
+async fn stream_to(
+    input: &Path,
+    partial: &Path,
+    cancel: &CancellationToken,
+) -> Result<u64, DecompressError> {
+    let cancelled = || DecompressError::Cancelled {
+        file: filename(input),
+    };
+    if cancel.is_cancelled() {
+        return Err(cancelled());
+    }
+    let source = tokio::select! {
+        _ = cancel.cancelled() => return Err(cancelled()),
+        source = File::open(input) => source,
+    }
+    .map_err(|source| DecompressError::Io {
+        path: input.to_path_buf(),
+        source,
+    })?;
     let mut decoder = XzDecoder::new(BufReader::new(source));
     let mut out = File::create(partial)
         .await
@@ -83,13 +103,14 @@ async fn stream_to(input: &Path, partial: &Path) -> Result<u64, DecompressError>
     let mut buf = vec![0u8; BUFFER_SIZE];
     let mut written: u64 = 0;
     loop {
-        let n = decoder
-            .read(&mut buf)
-            .await
-            .map_err(|err| DecompressError::Stream {
-                file: filename(input),
-                reason: stream_reason(&err),
-            })?;
+        let n = tokio::select! {
+            _ = cancel.cancelled() => return Err(cancelled()),
+            n = decoder.read(&mut buf) => n,
+        }
+        .map_err(|err| DecompressError::Stream {
+            file: filename(input),
+            reason: stream_reason(&err),
+        })?;
         if n == 0 {
             break;
         }
@@ -107,6 +128,12 @@ async fn stream_to(input: &Path, partial: &Path) -> Result<u64, DecompressError>
     })?;
     // Dropped here, before any rename: Windows refuses to rename a file that is still open.
     drop(out);
+
+    // The decode of the last block races the cancel too: a token set while the final read ran makes this a
+    // cancelled decode even though the bytes are all there, because the operator asked for it to stop.
+    if cancel.is_cancelled() {
+        return Err(cancelled());
+    }
 
     Ok(written)
 }
@@ -156,9 +183,10 @@ mod tests {
         let output = dir.path().join("image.img");
         std::fs::write(&input, xz(&image)).unwrap();
 
-        let done = decompress(&input, &output).await.unwrap();
+        let done = decompress(&input, &output, &CancellationToken::new())
+            .await
+            .unwrap();
 
-        assert_eq!(done.path, output);
         assert_eq!(done.bytes, image.len() as u64);
         assert_eq!(std::fs::read(&output).unwrap(), image);
         assert!(!partial_path(&output).exists());
@@ -173,7 +201,9 @@ mod tests {
         let output = dir.path().join("image.img");
         std::fs::write(&input, &compressed[..compressed.len() / 2]).unwrap();
 
-        let err = decompress(&input, &output).await.unwrap_err();
+        let err = decompress(&input, &output, &CancellationToken::new())
+            .await
+            .unwrap_err();
 
         assert!(matches!(err, DecompressError::Stream { .. }), "{err}");
         assert!(err.to_string().contains("truncated"), "{err}");
@@ -194,9 +224,57 @@ mod tests {
         let output = dir.path().join("image.img");
         std::fs::write(&input, &compressed).unwrap();
 
-        let err = decompress(&input, &output).await.unwrap_err();
+        let err = decompress(&input, &output, &CancellationToken::new())
+            .await
+            .unwrap_err();
 
         assert!(matches!(err, DecompressError::Stream { .. }), "{err}");
+        assert!(!output.exists());
+        assert!(!partial_path(&output).exists());
+    }
+
+    /// Task 7.3: cancelling a decode in progress stops it and leaves nothing at either name.
+    ///
+    /// A long, highly compressible stream is used so the decode is still running when the token fires: zeros
+    /// decode far faster than the noise payload, but 128 MiB of them still takes far longer than the 50 ms
+    /// before the cancel.
+    #[tokio::test]
+    async fn a_cancelled_decode_leaves_nothing() {
+        let image = vec![0u8; 128 * 1024 * 1024];
+        let dir = tempdir().unwrap();
+        let input = dir.path().join("image.img.xz");
+        let output = dir.path().join("image.img");
+        std::fs::write(&input, xz(&image)).unwrap();
+        let cancel = CancellationToken::new();
+        let c = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            c.cancel();
+        });
+
+        let err = decompress(&input, &output, &cancel).await.unwrap_err();
+
+        assert!(matches!(err, DecompressError::Cancelled { .. }), "{err}");
+        assert!(!output.exists(), "the output path must hold nothing");
+        assert!(
+            !partial_path(&output).exists(),
+            "the partial must be removed"
+        );
+    }
+
+    /// A token already cancelled before the call stops the decode before it opens the input.
+    #[tokio::test]
+    async fn a_cancel_before_the_call_starts_nothing() {
+        let dir = tempdir().unwrap();
+        let input = dir.path().join("image.img.xz");
+        let output = dir.path().join("image.img");
+        std::fs::write(&input, xz(&payload())).unwrap();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let err = decompress(&input, &output, &cancel).await.unwrap_err();
+
+        assert!(matches!(err, DecompressError::Cancelled { .. }), "{err}");
         assert!(!output.exists());
         assert!(!partial_path(&output).exists());
     }

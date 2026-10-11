@@ -4,10 +4,6 @@ preliminary_plans/*
 .agents/*
 skills-lock.json
 
-# Build output from `go build ./...`
-/pisquared
-/pisquared.exe
-
 # Build output from `cargo build`
 /target
 

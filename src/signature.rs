@@ -11,10 +11,10 @@ use std::path::{Path, PathBuf};
 
 use pgp::composed::{Deserializable, DetachedSignature, SignedPublicKey};
 use pgp::types::KeyDetails;
-use reqwest::StatusCode;
 use thiserror::Error;
+use tokio_util::sync::CancellationToken;
 
-use crate::fetch::describe;
+use crate::fetch::get;
 
 /// Appended to an image address for the publisher's detached signature.
 pub const SIGNATURE_SUFFIX: &str = ".asc";
@@ -38,6 +38,10 @@ pub enum SignatureCheck {
 
 #[derive(Debug, Error)]
 pub enum SignatureError {
+    /// The operator cancelled. Nothing is refused and nothing is verified: the check simply never concluded.
+    #[error("the signature check was cancelled")]
+    Cancelled,
+
     #[error("{file} does not verify against the signature published at {signature_url}: {reason}")]
     Refused {
         file: String,
@@ -62,37 +66,63 @@ pub struct Signer {
 
 /// Verifies the image at `image` against the signature published at `image_url` plus [`SIGNATURE_SUFFIX`], using
 /// the signing key at `key_url`. A signature that does not verify removes `image` and returns an error, so nothing
-/// is left presented as usable. A key or signature that cannot be retrieved is reported as unverified.
+/// is left presented as usable. A key or signature that cannot be retrieved is reported as unverified. A
+/// cancellation returns [`SignatureError::Cancelled`] with the image left in place for the caller to decide about,
+/// since the retrieval is raced against the token rather than left to conclude into the void.
 pub async fn verify_download(
     client: &reqwest::Client,
     image_url: &str,
     key_url: &str,
     image: &Path,
+    cancel: &CancellationToken,
 ) -> Result<SignatureCheck, SignatureError> {
+    if cancel.is_cancelled() {
+        return Err(SignatureError::Cancelled);
+    }
     let signature_url = format!("{image_url}{SIGNATURE_SUFFIX}");
     let unverified = |reason| SignatureCheck::Unverified {
         key_source: key_url.to_owned(),
         reason,
     };
 
-    let cert = match retrieve_key(client, key_url).await {
+    let (cert, armored) = tokio::select! {
+        _ = cancel.cancelled() => return Err(SignatureError::Cancelled),
+        (cert, armored) = async {
+            let cert = retrieve_key(client, key_url).await;
+            let armored = retrieve_signature(client, &signature_url).await;
+            (cert, armored)
+        } => (cert, armored),
+    };
+    let cert = match cert {
         Ok(cert) => cert,
         Err(reason) => return Ok(unverified(reason)),
     };
-    let armored = match retrieve_signature(client, &signature_url).await {
+    let armored = match armored {
         Ok(armored) => armored,
         Err(reason) => return Ok(unverified(reason)),
     };
+    if cancel.is_cancelled() {
+        return Err(SignatureError::Cancelled);
+    }
 
     let image_path = image.to_path_buf();
     let check_url = signature_url.clone();
-    let checked =
-        tokio::task::spawn_blocking(move || verify_file(&cert, &armored, &image_path, &check_url))
-            .await
-            .map_err(|err| SignatureError::Io {
+    let checked = tokio::select! {
+        _ = cancel.cancelled() => {
+            // The check runs to a conclusion on the blocking pool, where it cannot be interrupted, and its
+            // result is discarded: the operator asked for the run to stop, so this is not a verification.
+            return Err(SignatureError::Cancelled);
+        }
+        checked = tokio::task::spawn_blocking(move || {
+            verify_file(&cert, &armored, &image_path, &check_url)
+        }) =>
+        {
+            checked.map_err(|err| SignatureError::Io {
                 path: image.to_path_buf(),
                 source: io::Error::other(err),
-            })?;
+            })?
+        }
+    };
 
     match checked {
         Ok(signer) => Ok(SignatureCheck::Verified {
@@ -198,18 +228,6 @@ pub fn verify_file(
     })
 }
 
-async fn get(client: &reqwest::Client, url: &str) -> Result<Vec<u8>, String> {
-    let response = client.get(url).send().await.map_err(|err| describe(&err))?;
-    if response.status() != StatusCode::OK {
-        return Err(format!("the server answered {}", response.status()));
-    }
-    response
-        .bytes()
-        .await
-        .map(|body| body.to_vec())
-        .map_err(|err| describe(&err))
-}
-
 fn hex(id: impl AsRef<[u8]>) -> String {
     id.as_ref().iter().map(|b| format!("{b:02X}")).collect()
 }
@@ -217,80 +235,13 @@ fn hex(id: impl AsRef<[u8]>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_publisher::Publisher;
     use crate::test_server::{Reply, client, serve};
-    use pgp::composed::{
-        ArmorOptions, KeyType, SecretKeyParamsBuilder, SignedSecretSubKey, SubkeyParamsBuilder,
-    };
-    use pgp::crypto::hash::HashAlgorithm;
-    use pgp::types::Password;
     use std::collections::HashMap;
     use tempfile::{TempDir, tempdir};
 
     const IMAGE: &str = "DietPi_RPi5-ARMv8-Trixie.img.xz";
     const KEY: &str = "MichaIng.gpg";
-
-    /// A signing key shaped as the publisher's is: a certifying primary with a signing subkey, which makes the
-    /// signatures. Ed25519 keeps generation fast; the shape is what the verification depends on.
-    struct Publisher {
-        cert: SignedPublicKey,
-        subkey: SignedSecretSubKey,
-        primary_fingerprint: String,
-    }
-
-    impl Publisher {
-        fn new() -> Self {
-            let secret = SecretKeyParamsBuilder::default()
-                .key_type(KeyType::Ed25519)
-                .can_certify(true)
-                .can_sign(true)
-                .primary_user_id("MichaIng <micha@dietpi.com>".into())
-                .passphrase(None)
-                .subkey(
-                    SubkeyParamsBuilder::default()
-                        .key_type(KeyType::Ed25519)
-                        .can_sign(true)
-                        .build()
-                        .unwrap(),
-                )
-                .build()
-                .unwrap()
-                .generate(rand::thread_rng())
-                .unwrap();
-            let subkey = secret.secret_subkeys[0].clone();
-            let cert = SignedPublicKey::from(secret);
-            let primary_fingerprint = format!("{:X}", cert.primary_key.fingerprint());
-            Self {
-                cert,
-                subkey,
-                primary_fingerprint,
-            }
-        }
-
-        fn key_id(&self) -> String {
-            hex(self.subkey.key.legacy_key_id())
-        }
-
-        fn armored_key(&self) -> Vec<u8> {
-            self.cert
-                .to_armored_string(ArmorOptions::default())
-                .unwrap()
-                .into_bytes()
-        }
-
-        fn sign(&self, image: &[u8]) -> Vec<u8> {
-            DetachedSignature::sign_binary_data(
-                rand::thread_rng(),
-                &self.subkey.key,
-                &Password::empty(),
-                HashAlgorithm::Sha256,
-                image,
-            )
-            .unwrap()
-            .to_armored_string(ArmorOptions::default())
-            .unwrap()
-            .into_bytes()
-        }
-    }
 
     /// The image as the operator's machine holds it: a stand-in for the compressed bytes the signature covers.
     fn image_bytes() -> Vec<u8> {
@@ -362,6 +313,7 @@ mod tests {
             &format!("{base}{IMAGE}"),
             &format!("{base}{KEY}"),
             &image_path,
+            &CancellationToken::new(),
         )
         .await
         .unwrap();
@@ -401,6 +353,7 @@ mod tests {
             &format!("{base}{IMAGE}"),
             &format!("{base}{KEY}"),
             &image_path,
+            &CancellationToken::new(),
         )
         .await
         .unwrap_err();
@@ -429,6 +382,7 @@ mod tests {
             &format!("{base}{IMAGE}"),
             &format!("{base}{KEY}"),
             &image_path,
+            &CancellationToken::new(),
         )
         .await
         .unwrap_err();
@@ -455,6 +409,7 @@ mod tests {
             &format!("{base}{IMAGE}"),
             &format!("{base}{KEY}"),
             &image_path,
+            &CancellationToken::new(),
         )
         .await
         .unwrap();
@@ -482,6 +437,7 @@ mod tests {
             &format!("{base}{IMAGE}"),
             &format!("{base}{KEY}"),
             &image_path,
+            &CancellationToken::new(),
         )
         .await
         .unwrap();
@@ -510,6 +466,7 @@ mod tests {
             &format!("{base}{IMAGE}"),
             &format!("{base}{KEY}"),
             &image_path,
+            &CancellationToken::new(),
         )
         .await
         .unwrap();
@@ -539,6 +496,7 @@ mod tests {
             &format!("{base}{IMAGE}"),
             &format!("{base}{KEY}"),
             &image_path,
+            &CancellationToken::new(),
         )
         .await
         .unwrap();

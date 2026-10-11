@@ -18,6 +18,15 @@ pub(crate) enum Reply {
     Truncated { declared: usize, sent: Vec<u8> },
     /// The connection closes without any response.
     Silent,
+    /// No response is ever sent; the connection is held open, so a client waits indefinitely.
+    Hang,
+    /// The body is written in pieces with a pause between them, then the connection is held open without an
+    /// end declared. A client receives some bytes and then waits.
+    Slow {
+        body: Vec<u8>,
+        pieces: usize,
+        pause_ms: u64,
+    },
 }
 
 /// Starts a local server answering GET requests by path, returning its base address. Paths not in
@@ -67,6 +76,32 @@ fn answer(mut stream: TcpStream, routes: &HashMap<String, Reply>) {
         }
         Reply::Silent => {
             let _ = stream.shutdown(Shutdown::Both);
+        }
+        Reply::Hang => {
+            // The request has been read and nothing more is ever written. Parking this thread holds the
+            // connection open; the thread is never joined, so this is a way of never answering.
+            std::thread::park();
+        }
+        Reply::Slow {
+            body,
+            pieces,
+            pause_ms,
+        } => {
+            if write_response(&mut stream, 200, body.len(), &[]).is_err() {
+                return;
+            }
+            let piece = (body.len() / pieces.max(1)).max(1);
+            for chunk in body.chunks(piece) {
+                if stream
+                    .write_all(chunk)
+                    .and_then(|_| stream.flush())
+                    .is_err()
+                {
+                    return;
+                }
+                thread::sleep(std::time::Duration::from_millis(pause_ms));
+            }
+            std::thread::park();
         }
     }
 }

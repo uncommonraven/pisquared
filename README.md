@@ -8,8 +8,7 @@ Work proceeds one version at a time along the ladder in [`ROADMAP.md`](ROADMAP.m
 single observable result that someone else could check rather than take on trust. **The project is at v0.1.**
 Nothing below describes a finished program.
 
-v0.1 is being rewritten in Rust. The Go implementation is still in this repository and is removed once the Rust
-version replaces it.
+v0.1 is implemented in Rust. The earlier Go implementation is kept in git history only.
 
 ## What v0.1 produces
 
@@ -86,16 +85,6 @@ Rust format, lint, and test checks run on Linux, macOS, and Windows in
 [`.github/workflows/rust.yml`](.github/workflows/rust.yml) on every push to `main` and on every pull request. A
 platform-specific failure — a path separator, a rename across devices, a file that cannot be unlinked while
 open — is caught there rather than by an operator.
-
-### The Go implementation
-
-Until it is removed, the Go code builds with Go 1.27 or later and produces a single static executable:
-
-```sh
-go build ./...   # writes ./pisquared
-```
-
-Its workflow, [`.github/workflows/ci.yml`](.github/workflows/ci.yml), is manual-only.
 
 ## The ladder
 

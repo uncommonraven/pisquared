@@ -13,6 +13,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
+use tokio_util::sync::CancellationToken;
 
 /// Appended to an image address for the publisher's published checksum file.
 pub const CHECKSUM_SUFFIX: &str = ".sha256";
@@ -22,6 +23,17 @@ pub const PARTIAL_SUFFIX: &str = ".partial";
 
 /// Bounds how much of a published checksum file is read. The real ones carry one line per image.
 const MAX_PUBLISHED_SIZE: usize = 1 << 20;
+
+/// The reason a checksum could not be fetched because the run was cancelled first.
+const CANCELLED_BEFORE_CHECKSUM: &str = "the run was cancelled before the checksum was fetched";
+
+/// What a transfer reports as it runs, so an interface can show progress. `total` is what the publisher
+/// declared in the response, and is absent when it declared none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Progress {
+    pub written: u64,
+    pub total: Option<u64>,
+}
 
 /// How the downloaded file was checked. Only the two outcomes that leave a file in place appear here: a
 /// mismatch is an error, not a verification result.
@@ -33,16 +45,19 @@ pub enum Verification {
     Unverified { source: String, reason: String },
 }
 
-/// A completed download: where the file is, how big it is, and what it was verified against.
+/// A completed download: how big it is and what it was verified against.
 #[derive(Debug)]
 pub struct Download {
-    pub path: PathBuf,
     pub bytes: u64,
     pub verification: Verification,
 }
 
+/// Why a download stopped. A cancellation is a reason a transfer stopped, not a failure the tool caused.
 #[derive(Debug, Error)]
 pub enum FetchError {
+    #[error("the transfer of {file} was cancelled with nothing presented as finished")]
+    Cancelled { file: String },
+
     #[error("{url} answered {status}")]
     Status { url: String, status: StatusCode },
 
@@ -80,24 +95,66 @@ pub enum FetchError {
 /// [`CHECKSUM_SUFFIX`], and places it at `output` unless it fails verification.
 ///
 /// A transfer that is interrupted or fails leaves its partial file behind, which is nowhere near the output path.
-/// A retry truncates that file and starts over rather than resuming it.
+/// A retry truncates that file and starts over rather than resuming it. A cancellation or a mismatch removes the
+/// partial file, so bytes that were stopped or failed are kept nowhere.
 pub async fn download(
     client: &reqwest::Client,
     image_url: &str,
     output: &Path,
+    cancel: &CancellationToken,
+    mut progress: impl FnMut(Progress),
 ) -> Result<Download, FetchError> {
     let partial = partial_path(output);
-    let (bytes, observed) = transfer(client, image_url, &partial).await?;
+    let (bytes, verification) =
+        match fetch_and_verify(client, image_url, &partial, cancel, &mut progress).await {
+            Ok(checked) => checked,
+            Err(err) => {
+                if matches!(
+                    err,
+                    FetchError::Cancelled { .. } | FetchError::Mismatch { .. }
+                ) {
+                    let _ = tokio::fs::remove_file(&partial).await;
+                }
+                return Err(err);
+            }
+        };
 
+    // A cancel that arrives during the checksum fetch reads as unverified, so the token is checked here to keep
+    // a cancelled run from presenting the image at all.
+    if cancel.is_cancelled() {
+        let _ = tokio::fs::remove_file(&partial).await;
+        return Err(FetchError::Cancelled {
+            file: filename(image_url),
+        });
+    }
+    tokio::fs::rename(&partial, output)
+        .await
+        .map_err(|source| FetchError::Io {
+            path: output.to_path_buf(),
+            source,
+        })?;
+    Ok(Download {
+        bytes,
+        verification,
+    })
+}
+
+async fn fetch_and_verify(
+    client: &reqwest::Client,
+    image_url: &str,
+    partial: &Path,
+    cancel: &CancellationToken,
+    progress: &mut impl FnMut(Progress),
+) -> Result<(u64, Verification), FetchError> {
+    let (bytes, observed) = transfer(client, image_url, partial, cancel, progress).await?;
     let file = filename(image_url);
     let checksum_url = format!("{image_url}{CHECKSUM_SUFFIX}");
-    let verification = match retrieve(client, &checksum_url, &file).await {
+    let verification = match retrieve(client, &checksum_url, &file, cancel).await {
         Ok(expected) if expected == observed => Verification::Verified {
             source: checksum_url,
             digest: observed,
         },
         Ok(expected) => {
-            let _ = tokio::fs::remove_file(&partial).await;
             return Err(FetchError::Mismatch {
                 file,
                 checksum_url,
@@ -110,26 +167,27 @@ pub async fn download(
             reason,
         },
     };
-
-    tokio::fs::rename(&partial, output)
-        .await
-        .map_err(|source| FetchError::Io {
-            path: output.to_path_buf(),
-            source,
-        })?;
-    Ok(Download {
-        path: output.to_path_buf(),
-        bytes,
-        verification,
-    })
+    Ok((bytes, verification))
 }
 
 /// Streams the image into `partial`, returning how many bytes arrived and their SHA-256 as lowercase hex.
+///
+/// Every wait is raced against the cancellation token, so a cancel stops a transfer before its first chunk as
+/// readily as one mid-stream (the behaviour the 0.4 spike proved). Nothing here removes the partial file: the
+/// caller decides what a stopped transfer means.
 async fn transfer(
     client: &reqwest::Client,
     url: &str,
     partial: &Path,
+    cancel: &CancellationToken,
+    progress: &mut impl FnMut(Progress),
 ) -> Result<(u64, String), FetchError> {
+    let cancelled = || FetchError::Cancelled {
+        file: filename(url),
+    };
+    if cancel.is_cancelled() {
+        return Err(cancelled());
+    }
     if let Some(parent) = partial.parent()
         && !parent.as_os_str().is_empty()
     {
@@ -141,7 +199,10 @@ async fn transfer(
             })?;
     }
 
-    let mut response = client.get(url).send().await?;
+    let mut response = tokio::select! {
+        _ = cancel.cancelled() => return Err(cancelled()),
+        response = client.get(url).send() => response?,
+    };
     if response.status() != StatusCode::OK {
         return Err(FetchError::Status {
             url: url.to_owned(),
@@ -149,6 +210,7 @@ async fn transfer(
         });
     }
     let total = response.content_length();
+    progress(Progress { written: 0, total });
 
     let mut file = File::create(partial)
         .await
@@ -158,7 +220,10 @@ async fn transfer(
         })?;
     let mut hasher = Sha256::new();
     let mut written: u64 = 0;
-    while let Some(chunk) = response.chunk().await? {
+    while let Some(chunk) = tokio::select! {
+        _ = cancel.cancelled() => return Err(cancelled()),
+        chunk = response.chunk() => chunk?,
+    } {
         file.write_all(&chunk)
             .await
             .map_err(|source| FetchError::Io {
@@ -167,6 +232,7 @@ async fn transfer(
             })?;
         hasher.update(&chunk);
         written += chunk.len() as u64;
+        progress(Progress { written, total });
     }
     file.sync_all().await.map_err(|source| FetchError::Io {
         path: partial.to_path_buf(),
@@ -189,20 +255,22 @@ async fn transfer(
 }
 
 /// Fetches the published digest for `file` from `checksum_url`. The error is the reason it could not be had.
+///
+/// A cancel is reported through the caller's token check, not as a reason here: the fetch is raced against the
+/// token so a cancelled run does not wait on the checksum server.
 async fn retrieve(
     client: &reqwest::Client,
     checksum_url: &str,
     file: &str,
+    cancel: &CancellationToken,
 ) -> Result<String, String> {
-    let response = client
-        .get(checksum_url)
-        .send()
-        .await
-        .map_err(|err| describe(&err))?;
-    if response.status() != StatusCode::OK {
-        return Err(format!("the server answered {}", response.status()));
+    if cancel.is_cancelled() {
+        return Err(CANCELLED_BEFORE_CHECKSUM.to_owned());
     }
-    let body = response.bytes().await.map_err(|err| describe(&err))?;
+    let body = tokio::select! {
+        _ = cancel.cancelled() => return Err(CANCELLED_BEFORE_CHECKSUM.to_owned()),
+        body = get(client, checksum_url) => body?,
+    };
     if body.len() > MAX_PUBLISHED_SIZE {
         return Err(format!(
             "it is larger than the {MAX_PUBLISHED_SIZE} bytes a checksum file can be"
@@ -276,6 +344,19 @@ pub(crate) fn partial_path(output: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
+/// The body of a small file the publisher serves, or the reason it could not be had.
+pub(crate) async fn get(client: &reqwest::Client, url: &str) -> Result<Vec<u8>, String> {
+    let response = client.get(url).send().await.map_err(|err| describe(&err))?;
+    if response.status() != StatusCode::OK {
+        return Err(format!("the server answered {}", response.status()));
+    }
+    response
+        .bytes()
+        .await
+        .map(|body| body.to_vec())
+        .map_err(|err| describe(&err))
+}
+
 /// An error with its cause chain, so a reason reads "connection refused" rather than only "error sending request".
 pub(crate) fn describe(err: &reqwest::Error) -> String {
     let mut text = err.to_string();
@@ -336,11 +417,16 @@ mod tests {
         let dir = tempdir().unwrap();
         let output = dir.path().join(NAME);
 
-        let download = download(&client(), &format!("{base}{NAME}"), &output)
-            .await
-            .unwrap();
+        let download = download(
+            &client(),
+            &format!("{base}{NAME}"),
+            &output,
+            &CancellationToken::new(),
+            |_| {},
+        )
+        .await
+        .unwrap();
 
-        assert_eq!(download.path, output);
         assert_eq!(std::fs::read(&output).unwrap(), image);
         assert_eq!(download.bytes, image.len() as u64);
         assert!(!partial_path(&output).exists());
@@ -360,7 +446,14 @@ mod tests {
         let dir = tempdir().unwrap();
         let output = dir.path().join(NAME);
 
-        let result = download(&client(), &format!("{base}{NAME}"), &output).await;
+        let result = download(
+            &client(),
+            &format!("{base}{NAME}"),
+            &output,
+            &CancellationToken::new(),
+            |_| {},
+        )
+        .await;
 
         assert!(result.is_err(), "an interrupted transfer must fail");
         assert!(
@@ -388,13 +481,25 @@ mod tests {
         let output = dir.path().join(NAME);
 
         assert!(
-            download(&client(), &format!("{interrupted}{NAME}"), &output)
-                .await
-                .is_err()
-        );
-        download(&client(), &format!("{complete}{NAME}"), &output)
+            download(
+                &client(),
+                &format!("{interrupted}{NAME}"),
+                &output,
+                &CancellationToken::new(),
+                |_| {}
+            )
             .await
-            .unwrap();
+            .is_err()
+        );
+        download(
+            &client(),
+            &format!("{complete}{NAME}"),
+            &output,
+            &CancellationToken::new(),
+            |_| {},
+        )
+        .await
+        .unwrap();
 
         assert_eq!(std::fs::read(&output).unwrap(), image);
     }
@@ -410,9 +515,15 @@ mod tests {
         let dir = tempdir().unwrap();
         let output = dir.path().join(NAME);
 
-        let download = download(&client(), &format!("{base}{NAME}"), &output)
-            .await
-            .unwrap();
+        let download = download(
+            &client(),
+            &format!("{base}{NAME}"),
+            &output,
+            &CancellationToken::new(),
+            |_| {},
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             download.verification,
@@ -435,9 +546,15 @@ mod tests {
         let dir = tempdir().unwrap();
         let output = dir.path().join(NAME);
 
-        let err = download(&client(), &format!("{base}{NAME}"), &output)
-            .await
-            .unwrap_err();
+        let err = download(
+            &client(),
+            &format!("{base}{NAME}"),
+            &output,
+            &CancellationToken::new(),
+            |_| {},
+        )
+        .await
+        .unwrap_err();
 
         let message = err.to_string();
         assert!(message.contains(&published), "{message}");
@@ -454,9 +571,15 @@ mod tests {
         let dir = tempdir().unwrap();
         let output = dir.path().join(NAME);
 
-        let download = download(&client(), &format!("{base}{NAME}"), &output)
-            .await
-            .unwrap();
+        let download = download(
+            &client(),
+            &format!("{base}{NAME}"),
+            &output,
+            &CancellationToken::new(),
+            |_| {},
+        )
+        .await
+        .unwrap();
 
         match download.verification {
             Verification::Unverified { reason, .. } => {
@@ -475,9 +598,15 @@ mod tests {
         let dir = tempdir().unwrap();
         let output = dir.path().join(NAME);
 
-        let download = download(&client(), &format!("{base}{NAME}"), &output)
-            .await
-            .unwrap();
+        let download = download(
+            &client(),
+            &format!("{base}{NAME}"),
+            &output,
+            &CancellationToken::new(),
+            |_| {},
+        )
+        .await
+        .unwrap();
 
         match download.verification {
             Verification::Unverified { reason, .. } => assert!(!reason.is_empty()),
@@ -496,9 +625,15 @@ mod tests {
         let dir = tempdir().unwrap();
         let output = dir.path().join(NAME);
 
-        let download = download(&client(), &format!("{base}{NAME}"), &output)
-            .await
-            .unwrap();
+        let download = download(
+            &client(),
+            &format!("{base}{NAME}"),
+            &output,
+            &CancellationToken::new(),
+            |_| {},
+        )
+        .await
+        .unwrap();
 
         match download.verification {
             Verification::Unverified { reason, .. } => {
@@ -550,6 +685,81 @@ mod tests {
         assert_eq!(
             filename("https://dietpi.com/downloads/images/DietPi_RPi5-ARMv8-Trixie.img.xz?x=1"),
             NAME
+        );
+    }
+
+    /// Task 7.3: cancelling a transfer with no bytes yet stops it and leaves nothing at the output path.
+    #[tokio::test]
+    async fn a_cancel_before_the_first_chunk_leaves_nothing() {
+        let image = payload();
+        let base = serve(routes_for(
+            Reply::Hang,
+            Reply::Body(checksum_file(&image, NAME)),
+        ));
+        let dir = tempdir().unwrap();
+        let output = dir.path().join(NAME);
+        let cancel = CancellationToken::new();
+        let c = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            c.cancel();
+        });
+
+        let mut ticks = Vec::new();
+        let err = download(&client(), &format!("{base}{NAME}"), &output, &cancel, |p| {
+            ticks.push(p)
+        })
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, FetchError::Cancelled { .. }), "{err}");
+        assert!(
+            ticks.is_empty(),
+            "a transfer that never answered reported no progress"
+        );
+        assert!(!output.exists(), "the output path must hold nothing");
+        assert!(
+            !partial_path(&output).exists(),
+            "the partial must be removed"
+        );
+    }
+
+    /// Task 7.3: cancelling a transfer in progress stops it with some bytes arrived, and leaves nothing.
+    #[tokio::test]
+    async fn a_cancel_during_a_transfer_leaves_nothing() {
+        let image = payload();
+        let base = serve(routes_for(
+            Reply::Slow {
+                body: image.clone(),
+                pieces: 12,
+                pause_ms: 50,
+            },
+            Reply::Body(checksum_file(&image, NAME)),
+        ));
+        let dir = tempdir().unwrap();
+        let output = dir.path().join(NAME);
+        let cancel = CancellationToken::new();
+        let c = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            c.cancel();
+        });
+
+        let mut ticks = Vec::new();
+        let err = download(&client(), &format!("{base}{NAME}"), &output, &cancel, |p| {
+            ticks.push(p)
+        })
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, FetchError::Cancelled { .. }), "{err}");
+        let last = ticks.last().copied().expect("progress was reported");
+        assert!(last.written > 0, "the cancel came after bytes arrived");
+        assert_eq!(last.total, Some(image.len() as u64));
+        assert!(!output.exists(), "the output path must hold nothing");
+        assert!(
+            !partial_path(&output).exists(),
+            "the partial must be removed"
         );
     }
 }
