@@ -1,8 +1,13 @@
 //! Runs the obtaining procedure for one device from start to finish, writing every step to the step log.
 //!
-//! The steps are resolve, download with its checksum, signature, and decompress, in that order. A signature that
-//! cannot be checked halts the run, so an unverified image is never decompressed. Cancellation stops the run at
-//! the step it is in, because the operator asked it to stop rather than because anything failed.
+//! The steps are resolve, download with its checksum, signature, and decompress, in that order. A run completes
+//! only when the image's signature verifies, so only an image whose signature verified is ever decompressed.
+//!
+//! The downloaded image is removed from the output path whenever the run does not vouch for it: when its signature
+//! does not verify, when its signature cannot be checked, or when the run is cancelled. A checksum that cannot be
+//! had does not stop the run, because the signature is what gates success; the outcome says the checksum was
+//! unverified. Cancellation stops the run at the step it is in, because the operator asked it to stop rather than
+//! because anything failed.
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
@@ -11,17 +16,19 @@ use std::thread::{self, JoinHandle};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
-use crate::catalogue::{self, ADDRESS_PREFIX, NotListed};
-use crate::decompress::{self, DecompressError};
-use crate::fetch::{self, FetchError, Verification};
-use crate::log::{Step, StepLog};
-use crate::signature::{self, SIGNING_KEY_URL, SignatureCheck, SignatureError};
+use crate::backend::catalogue::{self, ADDRESS_PREFIX, NotListed, Resolution};
+use crate::backend::decompress::{self, DecompressError};
+use crate::backend::fetch::{self, Download, FetchError, Verification};
+use crate::backend::log::{Step, StepLog};
+use crate::backend::signature::{self, SIGNING_KEY_URL, SignatureCheck, SignatureError};
 
-/// What a completed run left on disk: the verified compressed image and the decompressed file beside it.
+/// What a completed run left on disk: the compressed image and the decompressed file beside it. The signature
+/// gates success, so the image's checksum may still be unverified; `verification` says which it was.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Obtained {
     pub image: PathBuf,
     pub flashable: PathBuf,
+    pub verification: Verification,
 }
 
 /// What the run is doing at this moment, reported as it changes so an attached interface can show a live state
@@ -40,7 +47,7 @@ pub enum RunError {
     NotListed(#[from] NotListed),
 
     #[error(transparent)]
-    Download(#[from] FetchError),
+    Download(FetchError),
 
     #[error(transparent)]
     Signature(#[from] SignatureError),
@@ -49,10 +56,30 @@ pub enum RunError {
     Unverified { file: String, reason: String },
 
     #[error(transparent)]
-    Decompress(#[from] DecompressError),
+    Decompress(DecompressError),
 
     #[error("the run was cancelled, and nothing is presented as finished")]
     Cancelled,
+}
+
+/// A transfer the operator stopped is a cancelled run, not a download failure.
+impl From<FetchError> for RunError {
+    fn from(err: FetchError) -> Self {
+        match err {
+            FetchError::Cancelled { .. } => RunError::Cancelled,
+            err => RunError::Download(err),
+        }
+    }
+}
+
+/// A decode the operator stopped is a cancelled run, not a decompression failure.
+impl From<DecompressError> for RunError {
+    fn from(err: DecompressError) -> Self {
+        match err {
+            DecompressError::Cancelled { .. } => RunError::Cancelled,
+            err => RunError::Decompress(err),
+        }
+    }
 }
 
 /// Where the publisher's images and signing key are fetched from.
@@ -76,45 +103,90 @@ pub async fn run(
     log: &mut StepLog,
 ) -> Result<Obtained, RunError> {
     report(Activity::Resolving);
-    let resolution = catalogue::resolve(device_id)
-        .inspect_err(|err| log.record(Step::Resolve, err.to_string()))?;
-    let device = resolution.device;
-    let address = format!("{}{}", sources.images, device.image_name());
-    log.record(
-        Step::Resolve,
-        format!("{} boots {}", device.name, device.image_name()),
-    );
-    log.record(Step::Resolve, format!("fetching from {address}"));
-    for caveat in resolution.caveats {
-        log.record(Step::Resolve, format!("caveat: {caveat}"));
-    }
+    let resolution = resolve_device(device_id, sources.images, log)?;
     if cancel.is_cancelled() {
         return Err(RunError::Cancelled);
     }
 
-    let image = output_dir.join(device.image_name());
+    let image = output_dir.join(resolution.device.image_name());
+    let download = download_image(
+        client,
+        &resolution.address,
+        &image,
+        cancel,
+        &mut report,
+        log,
+    )
+    .await?;
+
+    report(Activity::Verifying);
+    verify_signature(
+        client,
+        &resolution.address,
+        sources.signing_key,
+        &image,
+        cancel,
+        log,
+    )
+    .await?;
+
+    let flashable = image.with_extension("");
+    report(Activity::Decompressing);
+    decompress_image(&image, &flashable, cancel, log).await?;
+
+    Ok(Obtained {
+        image,
+        flashable,
+        verification: download.verification,
+    })
+}
+
+fn resolve_device(
+    device_id: &str,
+    images: &str,
+    log: &mut StepLog,
+) -> Result<Resolution, RunError> {
+    let resolution = catalogue::resolve(device_id, images)
+        .inspect_err(|err| log.record(Step::Resolve, err.to_string()))?;
+    log.record(
+        Step::Resolve,
+        format!(
+            "{} boots {}",
+            resolution.device.name,
+            resolution.device.image_name()
+        ),
+    );
+    log.record(
+        Step::Resolve,
+        format!("fetching from {}", resolution.address),
+    );
+    for caveat in resolution.caveats {
+        log.record(Step::Resolve, format!("caveat: {caveat}"));
+    }
+    Ok(resolution)
+}
+
+async fn download_image(
+    client: &reqwest::Client,
+    address: &str,
+    image: &Path,
+    cancel: &CancellationToken,
+    report: &mut impl FnMut(Activity),
+    log: &mut StepLog,
+) -> Result<Download, RunError> {
     report(Activity::Downloading {
         written: 0,
         total: None,
     });
-    let download = match fetch::download(client, &address, &image, cancel, |p| {
+    let download = fetch::download(client, address, image, cancel, |p| {
         report(Activity::Downloading {
             written: p.written,
             total: p.total,
         });
     })
     .await
-    {
-        Ok(download) => download,
-        Err(err) => {
-            log.record(Step::Download, err.to_string());
-            return Err(match err {
-                FetchError::Cancelled { .. } => RunError::Cancelled,
-                err => err.into(),
-            });
-        }
-    };
-    report(Activity::Verifying);
+    .inspect_err(|err| log.record(Step::Download, err.to_string()))?;
+
     log.record(
         Step::Download,
         format!("{} bytes written to {}", download.bytes, image.display()),
@@ -129,62 +201,75 @@ pub async fn run(
             format!("unverified against {source}: {reason}"),
         ),
     }
+    Ok(download)
+}
 
-    let check =
-        match signature::verify_download(client, &address, sources.signing_key, &image, cancel)
-            .await
-        {
-            Ok(check) => check,
-            Err(SignatureError::Cancelled) => {
-                log.record(Step::Signature, "cancelled");
-                // The bytes were checksummed but nothing checked their signature, so the operator is shown a
-                // cancellation rather than a file they could mistake for one the run vouched for.
-                let _ = tokio::fs::remove_file(&image).await;
-                log.record(
-                    Step::Signature,
-                    format!("removed {} before it was verified", image.display()),
-                );
-                return Err(RunError::Cancelled);
-            }
-            Err(err) => {
-                log.record(Step::Signature, err.to_string());
-                return Err(err.into());
-            }
-        };
-    match &check {
+async fn verify_signature(
+    client: &reqwest::Client,
+    address: &str,
+    signing_key: &str,
+    image: &Path,
+    cancel: &CancellationToken,
+    log: &mut StepLog,
+) -> Result<(), RunError> {
+    let check = match signature::verify_download(client, address, signing_key, image, cancel).await
+    {
+        Ok(check) => check,
+        Err(SignatureError::Cancelled) => {
+            log.record(Step::Signature, "cancelled");
+            remove_unvouched(image, log).await;
+            return Err(RunError::Cancelled);
+        }
+        Err(err) => {
+            log.record(Step::Signature, err.to_string());
+            return Err(err.into());
+        }
+    };
+
+    match check {
         SignatureCheck::Verified {
             key_id, key_source, ..
-        } => log.record(
-            Step::Signature,
-            format!(
-                "verified: made by signing key {key_id}, retrieved over HTTPS from {key_source} at the time of verification; the key is identified by its ID, not by a fingerprint checked against an independent source"
-            ),
-        ),
+        } => {
+            log.record(
+                Step::Signature,
+                format!(
+                    "verified: made by signing key {key_id}, retrieved over HTTPS from {key_source} at the time of verification; the key is identified by its ID, not by a fingerprint checked against an independent source"
+                ),
+            );
+            Ok(())
+        }
         SignatureCheck::Unverified { key_source, reason } => {
-            let halt = RunError::Unverified {
-                file: fetch::filename(&address),
-                reason: reason.clone(),
-            };
             log.record(
                 Step::Signature,
                 format!("unverified: key from {key_source}: {reason}"),
             );
-            return Err(halt);
+            remove_unvouched(image, log).await;
+            Err(RunError::Unverified {
+                file: fetch::filename(address),
+                reason,
+            })
         }
     }
+}
 
-    let flashable = image.with_extension("");
-    report(Activity::Decompressing);
-    let decompression = match decompress::decompress(&image, &flashable, cancel).await {
-        Ok(decompression) => decompression,
-        Err(err) => {
-            log.record(Step::Decompress, err.to_string());
-            return Err(match err {
-                DecompressError::Cancelled { .. } => RunError::Cancelled,
-                err => err.into(),
-            });
-        }
-    };
+/// Removes the image from the output path because the run does not vouch for it, and records that in the log.
+async fn remove_unvouched(image: &Path, log: &mut StepLog) {
+    let _ = tokio::fs::remove_file(image).await;
+    log.record(
+        Step::Signature,
+        format!("removed {} before it was verified", image.display()),
+    );
+}
+
+async fn decompress_image(
+    image: &Path,
+    flashable: &Path,
+    cancel: &CancellationToken,
+    log: &mut StepLog,
+) -> Result<(), RunError> {
+    let decompression = decompress::decompress(image, flashable, cancel, |_| {})
+        .await
+        .inspect_err(|err| log.record(Step::Decompress, err.to_string()))?;
     log.record(
         Step::Decompress,
         format!(
@@ -193,8 +278,7 @@ pub async fn run(
             flashable.display()
         ),
     );
-
-    Ok(Obtained { image, flashable })
+    Ok(())
 }
 
 /// A run on its own thread, so the interface keeps drawing and taking keys while the transfer goes on.
@@ -272,53 +356,30 @@ impl Job {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fetch::CHECKSUM_SUFFIX;
-    use crate::signature::SIGNATURE_SUFFIX;
-    use crate::test_publisher::Publisher;
-    use crate::test_server::{Reply, client, serve};
-    use liblzma::write::XzEncoder;
-    use sha2::{Digest, Sha256};
+    use crate::backend::fetch::CHECKSUM_SUFFIX;
+    use crate::backend::signature::SIGNATURE_SUFFIX;
+    use crate::testing::test_publisher::Publisher;
+    use crate::testing::test_server::{Reply, client, image_path, serve};
+    use crate::testing::test_support::{checksum_file, payload, sha256_hex, xz};
     use std::collections::HashMap;
-    use std::io::Write;
     use tempfile::tempdir;
-    use tokio_util::sync::CancellationToken;
 
     const IMAGE: &str = "DietPi_RPi5-ARMv8-Trixie.img.xz";
+    const FLASHABLE: &str = "DietPi_RPi5-ARMv8-Trixie.img";
     const KEY: &str = "MichaIng.gpg";
-
-    /// Three megabytes, larger than the decompression buffer, so the decompression takes several reads.
-    fn payload() -> Vec<u8> {
-        (0..3_000_000u32)
-            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
-            .collect()
-    }
-
-    fn compress(bytes: &[u8]) -> Vec<u8> {
-        let mut encoder = XzEncoder::new(Vec::new(), 6);
-        encoder.write_all(bytes).unwrap();
-        encoder.finish().unwrap()
-    }
-
-    fn sha256_hex(bytes: &[u8]) -> String {
-        format!("{:x}", Sha256::digest(bytes))
-    }
-
-    fn path(name: &str) -> String {
-        format!("/images/{name}")
-    }
 
     fn routes(image: &[u8], signature: Vec<u8>, key: Vec<u8>) -> HashMap<String, Reply> {
         HashMap::from([
-            (path(IMAGE), Reply::Body(image.to_vec())),
+            (image_path(IMAGE), Reply::Body(image.to_vec())),
             (
-                path(&format!("{IMAGE}{CHECKSUM_SUFFIX}")),
-                Reply::Body(format!("{}  {IMAGE}\n", sha256_hex(image)).into_bytes()),
+                image_path(&format!("{IMAGE}{CHECKSUM_SUFFIX}")),
+                Reply::Body(checksum_file(image, IMAGE)),
             ),
             (
-                path(&format!("{IMAGE}{SIGNATURE_SUFFIX}")),
+                image_path(&format!("{IMAGE}{SIGNATURE_SUFFIX}")),
                 Reply::Body(signature),
             ),
-            (path(KEY), Reply::Body(key)),
+            (image_path(KEY), Reply::Body(key)),
         ])
     }
 
@@ -348,7 +409,7 @@ mod tests {
     async fn a_full_run_writes_every_step_to_the_log() {
         let publisher = Publisher::new();
         let data = payload();
-        let image = compress(&data);
+        let image = xz(&data);
         let base = serve(routes(
             &image,
             publisher.sign(&image),
@@ -367,7 +428,11 @@ mod tests {
             obtained,
             Obtained {
                 image: dir.path().join(IMAGE),
-                flashable: dir.path().join("DietPi_RPi5-ARMv8-Trixie.img"),
+                flashable: dir.path().join(FLASHABLE),
+                verification: Verification::Verified {
+                    source: format!("{base}{IMAGE}{CHECKSUM_SUFFIX}"),
+                    digest: sha256_hex(&image),
+                },
             }
         );
         // The run reports each state in order, and the transfer's final state says every byte arrived.
@@ -395,21 +460,13 @@ mod tests {
         let rendered = log.to_string();
         assert!(rendered.contains(&publisher.key_id()), "{rendered}");
         assert!(rendered.contains(&format!("{base}{KEY}")), "{rendered}");
-        assert!(
-            rendered.contains("at the time of verification"),
-            "{rendered}"
-        );
-        assert!(
-            rendered.contains("not by a fingerprint checked against an independent source"),
-            "{rendered}"
-        );
     }
 
     #[tokio::test]
     async fn a_refused_signature_halts_the_run_and_the_log_says_why() {
         let publisher = Publisher::new();
         let data = payload();
-        let image = compress(&data);
+        let image = xz(&data);
         let mut tampered = image.clone();
         tampered[1000] ^= 0x01;
         let base = serve(routes(
@@ -429,17 +486,74 @@ mod tests {
         assert_eq!(steps(&log).last(), Some(&Step::Signature));
         assert!(log.to_string().contains("does not verify"), "{log}");
         assert!(!dir.path().join(IMAGE).exists());
-        assert!(!dir.path().join("DietPi_RPi5-ARMv8-Trixie.img").exists());
+        assert!(!dir.path().join(FLASHABLE).exists());
     }
 
-    /// Task 7.3: cancelling a run mid-transfer ends it with `Cancelled`, and the output directory is left empty.
+    /// A signature that cannot be checked halts the run, removes the image so nothing the run did not vouch for is
+    /// left at the output path, and never decompresses it.
+    #[tokio::test]
+    async fn an_unverified_signature_halts_the_run_and_removes_the_image() {
+        let publisher = Publisher::new();
+        let image = xz(&payload());
+        let mut served = routes(&image, publisher.sign(&image), publisher.armored_key());
+        served.insert(
+            image_path(&format!("{IMAGE}{SIGNATURE_SUFFIX}")),
+            Reply::Status(404),
+        );
+        let base = serve(served);
+        let dir = tempdir().unwrap();
+        let mut log = StepLog::default();
+        let cancel = CancellationToken::new();
+
+        let err = obtain(&base, dir.path(), &cancel, |_| {}, &mut log)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(&err, RunError::Unverified { reason, .. } if reason.contains("404")),
+            "{err}"
+        );
+        assert_eq!(steps(&log).last(), Some(&Step::Signature));
+        assert!(!dir.path().join(IMAGE).exists());
+        assert!(!dir.path().join(FLASHABLE).exists());
+    }
+
+    /// A checksum that cannot be had does not stop a run whose signature verifies, and the outcome says the
+    /// checksum was unverified.
+    #[tokio::test]
+    async fn an_unretrievable_checksum_does_not_stop_a_run_with_a_verified_signature() {
+        let publisher = Publisher::new();
+        let image = xz(&payload());
+        let mut served = routes(&image, publisher.sign(&image), publisher.armored_key());
+        served.insert(
+            image_path(&format!("{IMAGE}{CHECKSUM_SUFFIX}")),
+            Reply::Status(404),
+        );
+        let base = serve(served);
+        let dir = tempdir().unwrap();
+        let mut log = StepLog::default();
+        let cancel = CancellationToken::new();
+
+        let obtained = obtain(&base, dir.path(), &cancel, |_| {}, &mut log)
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(&obtained.verification, Verification::Unverified { reason, .. } if reason.contains("404")),
+            "{obtained:?}"
+        );
+        assert!(obtained.flashable.exists());
+    }
+
+    /// Cancelling a run mid-transfer ends it with `Cancelled`, and the output directory is left empty. The cancel is
+    /// issued from the progress report once bytes have arrived, so it is certain to land mid-transfer.
     #[tokio::test]
     async fn a_run_cancelled_mid_transfer_leaves_the_directory_empty() {
         let publisher = Publisher::new();
-        let image = compress(&payload());
+        let image = xz(&payload());
         let mut served = routes(&image, publisher.sign(&image), publisher.armored_key());
         served.insert(
-            path(IMAGE),
+            image_path(IMAGE),
             Reply::Slow {
                 body: image.clone(),
                 pieces: 12,
@@ -451,13 +565,15 @@ mod tests {
         let mut log = StepLog::default();
         let cancel = CancellationToken::new();
         let token = cancel.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            token.cancel();
-        });
         let mut seen = Vec::new();
+        let report = |activity: Activity| {
+            if matches!(activity, Activity::Downloading { written, .. } if written > 0) {
+                token.cancel();
+            }
+            seen.push(activity);
+        };
 
-        let err = obtain(&base, dir.path(), &cancel, |a| seen.push(a), &mut log)
+        let err = obtain(&base, dir.path(), &cancel, report, &mut log)
             .await
             .unwrap_err();
 

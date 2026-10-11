@@ -11,8 +11,9 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout};
 use ratatui::widgets::{Block, Gauge, Paragraph, Wrap};
 
-use crate::run::{Activity, Job, Obtained, RunError};
-use crate::select;
+use crate::backend::fetch::Verification;
+use crate::backend::run::{Activity, Job, Obtained, RunError};
+use crate::frontend::select;
 
 pub struct Model {
     select: select::Model,
@@ -92,10 +93,23 @@ pub fn view(model: &Model, frame: &mut Frame) {
 fn outcome(result: &Result<Obtained, RunError>) -> String {
     match result {
         Ok(obtained) => format!(
-            "Obtained {}. The download was verified; the decompressed file is not, since the publisher publishes no value for it.\nPress Esc to quit.",
-            obtained.flashable.display()
+            "Obtained {}. {} The decompressed file is not verified, since the publisher publishes no value for it.\nPress Esc to quit.",
+            obtained.flashable.display(),
+            checksum_outcome(&obtained.verification)
         ),
         Err(err) => format!("{err}\nPress Esc to quit."),
+    }
+}
+
+fn checksum_outcome(verification: &Verification) -> String {
+    match verification {
+        Verification::Verified { .. } => {
+            "The download's checksum matches the one the publisher published, and its signature was verified."
+                .to_owned()
+        }
+        Verification::Unverified { reason, .. } => format!(
+            "The download's signature was verified, but its checksum was not: {reason}."
+        ),
     }
 }
 
@@ -213,6 +227,30 @@ mod tests {
         assert!(model.select.chosen().is_some());
 
         assert!(update(&mut model, &key(KeyCode::Esc, KeyModifiers::NONE)));
+    }
+
+    #[test]
+    fn an_outcome_states_the_checksum_as_it_was_found() {
+        let obtained = |verification| {
+            outcome(&Ok(Obtained {
+                image: PathBuf::from("image.img.xz"),
+                flashable: PathBuf::from("image.img"),
+                verification,
+            }))
+        };
+
+        let unverified = obtained(Verification::Unverified {
+            source: "https://example.com/image.img.xz.sha256".to_owned(),
+            reason: "the server answered 404 Not Found".to_owned(),
+        });
+        assert!(unverified.contains("404 Not Found"), "{unverified}");
+        assert!(!unverified.contains("matches"), "{unverified}");
+
+        let verified = obtained(Verification::Verified {
+            source: "https://example.com/image.img.xz.sha256".to_owned(),
+            digest: "00".to_owned(),
+        });
+        assert!(verified.contains("matches"), "{verified}");
     }
 
     #[test]

@@ -10,7 +10,7 @@ use ratatui::layout::{Constraint, Layout};
 use ratatui::style::Style;
 use ratatui::widgets::{Block, List, ListState, Paragraph, Wrap};
 
-use crate::catalogue::{self, DEVICES, Device};
+use crate::backend::catalogue::{DEVICES, Device};
 
 #[derive(Debug, Default)]
 pub struct Model {
@@ -108,8 +108,6 @@ fn detail(model: &Model) -> String {
         return "No device matches the filter, so no image is chosen.".to_owned();
     };
 
-    let resolution =
-        catalogue::resolve(device.id).expect("the highlighted device is in the catalogue");
     let status = match model.chosen() {
         Some(chosen) => format!(
             "Chosen: {}. Nothing has been fetched. Press Enter again to start the download.",
@@ -119,12 +117,12 @@ fn detail(model: &Model) -> String {
     };
     let mut lines = vec![
         status,
-        format!("Device: {}", resolution.device.name),
-        format!("Image: {}", resolution.device.image_name()),
-        format!("Address: {}", resolution.address),
+        format!("Device: {}", device.name),
+        format!("Image: {}", device.image_name()),
+        format!("Address: {}", device.address()),
     ];
     lines.extend(
-        resolution
+        device
             .caveats
             .iter()
             .map(|caveat| format!("Caveat: {caveat}")),
@@ -135,7 +133,7 @@ fn detail(model: &Model) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalogue::CAVEAT_RPI234_PI5;
+    use crate::backend::catalogue::CAVEAT_RPI234_PI5;
     use crossterm::event::KeyEvent;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -240,7 +238,7 @@ mod tests {
         assert_eq!(model.filter, "");
     }
 
-    /// Task 7.2: the view names the chosen image in full, with its address, and nothing else's image.
+    /// The view names the chosen image in full, with its address, and nothing else's image.
     #[test]
     fn the_rendered_view_names_the_chosen_image_in_full() {
         let mut model = Model::default();
@@ -262,7 +260,7 @@ mod tests {
         assert!(!rendered.contains("Caveat:"), "{rendered}");
     }
 
-    /// Task 7.2: a caveat reaches the display for the device it attaches to, before the device is chosen.
+    /// A caveat reaches the display for the device it attaches to, before the device is chosen.
     #[test]
     fn a_caveat_reaches_the_display_before_anything_is_chosen() {
         let mut model = Model::default();

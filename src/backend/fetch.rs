@@ -173,8 +173,8 @@ async fn fetch_and_verify(
 /// Streams the image into `partial`, returning how many bytes arrived and their SHA-256 as lowercase hex.
 ///
 /// Every wait is raced against the cancellation token, so a cancel stops a transfer before its first chunk as
-/// readily as one mid-stream (the behaviour the 0.4 spike proved). Nothing here removes the partial file: the
-/// caller decides what a stopped transfer means.
+/// readily as one mid-stream. Nothing here removes the partial file: the caller decides what a stopped transfer
+/// means.
 async fn transfer(
     client: &reqwest::Client,
     url: &str,
@@ -372,43 +372,24 @@ pub(crate) fn describe(err: &reqwest::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_server::{Reply, client, serve};
+    use crate::testing::test_server::{Reply, client, image_path, serve};
+    use crate::testing::test_support::{checksum_file, payload, sha256_hex};
     use std::collections::HashMap;
     use tempfile::tempdir;
 
     const NAME: &str = "DietPi_RPi5-ARMv8-Trixie.img.xz";
 
-    /// Three megabytes, larger than any single read, so the transfer takes several chunks.
-    fn payload() -> Vec<u8> {
-        (0..3_000_000u32)
-            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
-            .collect()
-    }
-
-    fn sha256_hex(bytes: &[u8]) -> String {
-        format!("{:x}", Sha256::digest(bytes))
-    }
-
-    /// A checksum file in sha256sum's format, as the publisher serves it.
-    fn checksum_file(bytes: &[u8], name: &str) -> Vec<u8> {
-        format!("{}  {name}\n", sha256_hex(bytes)).into_bytes()
-    }
-
-    /// The path a file is served at under the server's base.
-    fn path(name: &str) -> String {
-        format!("/images/{name}")
-    }
-
     fn routes_for(image: Reply, checksum: Reply) -> HashMap<String, Reply> {
         HashMap::from([
-            (path(NAME), image),
-            (path(&format!("{NAME}{CHECKSUM_SUFFIX}")), checksum),
+            (image_path(NAME), image),
+            (image_path(&format!("{NAME}{CHECKSUM_SUFFIX}")), checksum),
         ])
     }
 
-    /// Task 4.1: a completed transfer appears at the output path, and nothing is left at the partial name.
+    /// A completed transfer appears at the output path with its bytes, verified against the published checksum,
+    /// and nothing is left at the partial name.
     #[tokio::test]
-    async fn a_completed_transfer_appears_at_the_output_path() {
+    async fn a_completed_transfer_is_verified_and_appears_at_the_output_path() {
         let image = payload();
         let base = serve(routes_for(
             Reply::Body(image.clone()),
@@ -430,41 +411,19 @@ mod tests {
         assert_eq!(std::fs::read(&output).unwrap(), image);
         assert_eq!(download.bytes, image.len() as u64);
         assert!(!partial_path(&output).exists());
-    }
-
-    /// Task 4.1: an interrupted transfer does not appear at the output path.
-    #[tokio::test]
-    async fn an_interrupted_transfer_does_not_appear_at_the_output_path() {
-        let image = payload();
-        let base = serve(routes_for(
-            Reply::Truncated {
-                declared: image.len(),
-                sent: image[..image.len() / 2].to_vec(),
-            },
-            Reply::Body(checksum_file(&image, NAME)),
-        ));
-        let dir = tempdir().unwrap();
-        let output = dir.path().join(NAME);
-
-        let result = download(
-            &client(),
-            &format!("{base}{NAME}"),
-            &output,
-            &CancellationToken::new(),
-            |_| {},
-        )
-        .await;
-
-        assert!(result.is_err(), "an interrupted transfer must fail");
-        assert!(
-            !output.exists(),
-            "the output path must not hold a partial image"
+        assert_eq!(
+            download.verification,
+            Verification::Verified {
+                source: format!("{base}{NAME}{CHECKSUM_SUFFIX}"),
+                digest: sha256_hex(&image),
+            }
         );
     }
 
-    /// Task 4.1: a retry starts over and reaches the same bytes an uninterrupted transfer would.
+    /// An interrupted transfer fails without appearing at the output path, and a retry starts over and reaches the
+    /// same bytes an uninterrupted transfer would.
     #[tokio::test]
-    async fn a_retry_after_an_interruption_reaches_the_same_bytes() {
+    async fn an_interrupted_transfer_is_not_presented_and_a_retry_reaches_the_same_bytes() {
         let image = payload();
         let interrupted = serve(routes_for(
             Reply::Truncated {
@@ -480,17 +439,20 @@ mod tests {
         let dir = tempdir().unwrap();
         let output = dir.path().join(NAME);
 
+        let result = download(
+            &client(),
+            &format!("{interrupted}{NAME}"),
+            &output,
+            &CancellationToken::new(),
+            |_| {},
+        )
+        .await;
+        assert!(result.is_err(), "an interrupted transfer must fail");
         assert!(
-            download(
-                &client(),
-                &format!("{interrupted}{NAME}"),
-                &output,
-                &CancellationToken::new(),
-                |_| {}
-            )
-            .await
-            .is_err()
+            !output.exists(),
+            "the output path must not hold a partial image"
         );
+
         download(
             &client(),
             &format!("{complete}{NAME}"),
@@ -504,37 +466,6 @@ mod tests {
         assert_eq!(std::fs::read(&output).unwrap(), image);
     }
 
-    /// Task 4.2: a matching checksum is reported as verified.
-    #[tokio::test]
-    async fn a_matching_checksum_is_reported_verified() {
-        let image = payload();
-        let base = serve(routes_for(
-            Reply::Body(image.clone()),
-            Reply::Body(checksum_file(&image, NAME)),
-        ));
-        let dir = tempdir().unwrap();
-        let output = dir.path().join(NAME);
-
-        let download = download(
-            &client(),
-            &format!("{base}{NAME}"),
-            &output,
-            &CancellationToken::new(),
-            |_| {},
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(
-            download.verification,
-            Verification::Verified {
-                source: format!("{base}{NAME}{CHECKSUM_SUFFIX}"),
-                digest: sha256_hex(&image),
-            }
-        );
-    }
-
-    /// Task 4.2: a mismatch fails naming both values, and leaves nothing at the output path.
     #[tokio::test]
     async fn a_mismatch_fails_naming_both_values_and_leaves_nothing() {
         let image = payload();
@@ -563,7 +494,7 @@ mod tests {
         assert!(!partial_path(&output).exists());
     }
 
-    /// Task 4.3: a checksum the publisher refuses is unverified with its reason, and is not verified or a mismatch.
+    /// A checksum the publisher refuses leaves the image in place, unverified, with the status as its reason.
     #[tokio::test]
     async fn an_unretrievable_checksum_is_unverified_with_its_reason() {
         let image = payload();
@@ -590,7 +521,8 @@ mod tests {
         assert_eq!(std::fs::read(&output).unwrap(), image);
     }
 
-    /// Task 4.3: a checksum server that cannot be reached is unverified, not a mismatch.
+    /// A checksum server that cannot be reached leaves the image in place, unverified with the reason the request
+    /// failed, and is never reported as a mismatch.
     #[tokio::test]
     async fn an_unreachable_checksum_is_unverified_not_a_mismatch() {
         let image = payload();
@@ -609,12 +541,18 @@ mod tests {
         .unwrap();
 
         match download.verification {
-            Verification::Unverified { reason, .. } => assert!(!reason.is_empty()),
+            Verification::Unverified { reason, .. } => {
+                assert!(
+                    reason.contains("connection"),
+                    "reason {reason:?} says the connection failed"
+                );
+            }
             other => panic!("expected unverified, got {other:?}"),
         }
+        assert_eq!(std::fs::read(&output).unwrap(), image);
     }
 
-    /// Task 4.3: a checksum file that cannot be read is unverified, not a mismatch.
+    /// A checksum file that cannot be read leaves the image in place, unverified, with the reason it was unreadable.
     #[tokio::test]
     async fn an_unreadable_checksum_is_unverified_not_a_mismatch() {
         let image = payload();
@@ -688,7 +626,8 @@ mod tests {
         );
     }
 
-    /// Task 7.3: cancelling a transfer with no bytes yet stops it and leaves nothing at the output path.
+    /// A cancel that lands before any byte arrives stops the transfer and leaves nothing at the output path. The
+    /// server never answers, so the cancel is the only thing that can end the transfer.
     #[tokio::test]
     async fn a_cancel_before_the_first_chunk_leaves_nothing() {
         let image = payload();
@@ -700,10 +639,7 @@ mod tests {
         let output = dir.path().join(NAME);
         let cancel = CancellationToken::new();
         let c = cancel.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            c.cancel();
-        });
+        tokio::spawn(async move { c.cancel() });
 
         let mut ticks = Vec::new();
         let err = download(&client(), &format!("{base}{NAME}"), &output, &cancel, |p| {
@@ -724,7 +660,8 @@ mod tests {
         );
     }
 
-    /// Task 7.3: cancelling a transfer in progress stops it with some bytes arrived, and leaves nothing.
+    /// A cancel that lands once bytes have arrived stops the transfer with those bytes reported, and leaves nothing.
+    /// The cancel is issued from the progress callback, so it is certain to land mid-transfer.
     #[tokio::test]
     async fn a_cancel_during_a_transfer_leaves_nothing() {
         let image = payload();
@@ -740,13 +677,12 @@ mod tests {
         let output = dir.path().join(NAME);
         let cancel = CancellationToken::new();
         let c = cancel.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            c.cancel();
-        });
 
         let mut ticks = Vec::new();
         let err = download(&client(), &format!("{base}{NAME}"), &output, &cancel, |p| {
+            if p.written > 0 {
+                c.cancel();
+            }
             ticks.push(p)
         })
         .await

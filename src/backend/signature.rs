@@ -14,7 +14,7 @@ use pgp::types::KeyDetails;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
-use crate::fetch::get;
+use crate::backend::fetch::get;
 
 /// Appended to an image address for the publisher's detached signature.
 pub const SIGNATURE_SUFFIX: &str = ".asc";
@@ -228,15 +228,15 @@ pub fn verify_file(
     })
 }
 
-fn hex(id: impl AsRef<[u8]>) -> String {
+pub(crate) fn hex(id: impl AsRef<[u8]>) -> String {
     id.as_ref().iter().map(|b| format!("{b:02X}")).collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_publisher::Publisher;
-    use crate::test_server::{Reply, client, serve};
+    use crate::testing::test_publisher::Publisher;
+    use crate::testing::test_server::{Reply, client, image_path, serve};
     use std::collections::HashMap;
     use tempfile::{TempDir, tempdir};
 
@@ -248,14 +248,10 @@ mod tests {
         b"compressed image bytes ".repeat(20_000)
     }
 
-    fn path(name: &str) -> String {
-        format!("/images/{name}")
-    }
-
     fn routes(key: Reply, signature: Reply) -> HashMap<String, Reply> {
         HashMap::from([
-            (path(KEY), key),
-            (path(&format!("{IMAGE}{SIGNATURE_SUFFIX}")), signature),
+            (image_path(KEY), key),
+            (image_path(&format!("{IMAGE}{SIGNATURE_SUFFIX}")), signature),
         ])
     }
 
@@ -266,15 +262,9 @@ mod tests {
         image
     }
 
-    /// Task 5.1: the key is named at the publisher's GitHub account over HTTPS.
-    #[test]
-    fn the_signing_key_is_named_where_the_publisher_publishes_it() {
-        assert_eq!(SIGNING_KEY_URL, "https://github.com/MichaIng.gpg");
-    }
-
-    /// Task 5.1: the key and the detached signature are obtained, and the key is the publisher's.
+    /// The key and the detached signature are retrieved from their addresses, and the key is the publisher's.
     #[tokio::test]
-    async fn the_key_and_signature_are_obtained_in_memory() {
+    async fn the_key_and_signature_are_retrieved_from_their_addresses() {
         let publisher = Publisher::new();
         let image = image_bytes();
         let base = serve(routes(
@@ -296,7 +286,8 @@ mod tests {
         assert!(armored.starts_with("-----BEGIN PGP SIGNATURE-----"));
     }
 
-    /// Task 5.2: a good signature reports the key that made it, found by its key ID among the subkeys.
+    /// A good signature reports the key that made it, found by its key ID among the subkeys, and writes nothing
+    /// beside the image.
     #[tokio::test]
     async fn a_good_signature_reports_the_key_that_made_it() {
         let publisher = Publisher::new();
@@ -334,7 +325,7 @@ mod tests {
         assert_eq!(entries, vec![std::ffi::OsString::from(IMAGE)]);
     }
 
-    /// Task 5.2 and 5.4: a tampered image fails, halts the run with the reason, and is left nowhere.
+    /// A tampered image fails, halts with the reason, and is removed.
     #[tokio::test]
     async fn a_tampered_image_halts_with_the_reason_and_is_removed() {
         let publisher = Publisher::new();
@@ -364,7 +355,7 @@ mod tests {
         assert!(!image_path.exists());
     }
 
-    /// Task 5.2: a signature made by a key the publisher's key does not contain fails, naming that key.
+    /// A signature made by a key the publisher's key does not contain fails, naming that key.
     #[tokio::test]
     async fn a_signature_from_an_unrelated_key_fails_naming_the_key() {
         let publisher = Publisher::new();
@@ -392,7 +383,7 @@ mod tests {
         assert!(!image_path.exists());
     }
 
-    /// Task 5.3: a signing key that cannot be retrieved is unverified with its reason, and the image is kept.
+    /// A signing key that cannot be retrieved is unverified with its reason, and the image is kept.
     #[tokio::test]
     async fn an_unretrievable_key_is_unverified_with_its_reason() {
         let publisher = Publisher::new();
@@ -423,7 +414,8 @@ mod tests {
         assert!(image_path.exists());
     }
 
-    /// Task 5.3: a signing key that never answers is unverified, not a bad signature.
+    /// A signing key that never answers is unverified, with the reason the retrieval failed, and is never a bad
+    /// signature.
     #[tokio::test]
     async fn an_unreachable_key_is_unverified_not_a_bad_signature() {
         let publisher = Publisher::new();
@@ -443,13 +435,16 @@ mod tests {
         .unwrap();
 
         match check {
-            SignatureCheck::Unverified { reason, .. } => assert!(!reason.is_empty()),
+            SignatureCheck::Unverified { reason, .. } => assert!(
+                reason.starts_with("the signing key could not be retrieved: "),
+                "{reason}"
+            ),
             other => panic!("expected unverified, got {other:?}"),
         }
         assert!(image_path.exists());
     }
 
-    /// Task 5.3: a key that is served but cannot be read is unverified, not a bad signature.
+    /// A key that is served but cannot be read is unverified, not a bad signature.
     #[tokio::test]
     async fn an_unreadable_key_is_unverified_not_a_bad_signature() {
         let publisher = Publisher::new();
@@ -479,7 +474,7 @@ mod tests {
         }
     }
 
-    /// Task 5.3: a signature that cannot be retrieved is unverified with its reason, and never verified.
+    /// A signature that cannot be retrieved is unverified with its reason, and never verified.
     #[tokio::test]
     async fn an_absent_signature_is_unverified_with_its_reason() {
         let publisher = Publisher::new();

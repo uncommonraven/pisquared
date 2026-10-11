@@ -1,11 +1,6 @@
-openspec/*
-preliminary_plans/*
 .opencode/*
 .agents/*
 skills-lock.json
 
 # Build output from `cargo build`
 /target
-
-rustexperiment/*
-spikes/*

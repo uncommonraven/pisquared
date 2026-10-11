@@ -7,6 +7,8 @@ use pgp::composed::{
 use pgp::crypto::hash::HashAlgorithm;
 use pgp::types::{KeyDetails, Password};
 
+use crate::backend::signature::hex;
+
 /// A certifying primary with a signing subkey, which makes the signatures. Ed25519 keeps generation fast; the shape
 /// is what the verification depends on.
 pub(crate) struct Publisher {
@@ -45,13 +47,7 @@ impl Publisher {
     }
 
     pub(crate) fn key_id(&self) -> String {
-        self.subkey
-            .key
-            .legacy_key_id()
-            .as_ref()
-            .iter()
-            .map(|b| format!("{b:02X}"))
-            .collect()
+        hex(self.subkey.key.legacy_key_id())
     }
 
     pub(crate) fn armored_key(&self) -> Vec<u8> {

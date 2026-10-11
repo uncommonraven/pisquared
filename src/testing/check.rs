@@ -1,20 +1,22 @@
-//! The build-time link check.
+//! The link check: every image address in the catalogue, requested with a HEAD request.
 //!
-//! Every image address committed in the catalogue is requested with a HEAD request, once per distinct
-//! address, and every address that does not resolve is reported by name. The failure it catches is
-//! upstream renaming or removing an image, which would otherwise reach an operator as a 404 partway
-//! through a 200 MiB download. It does not catch upstream adding a board, because nothing tells us to look.
+//! Each distinct address is requested once, and every address that does not resolve is reported by name. The failure
+//! it catches is the publisher renaming or removing an image, which would otherwise reach an operator as a 404 partway
+//! through a 200 MiB download. It does not catch the publisher adding a board, because nothing tells us to look.
+//!
+//! The check reaches the publisher's servers, so nothing runs it on a push. The `catalogue-addresses` CI job runs it
+//! on demand, through the ignored test at the end of this module.
 
 use std::fmt;
 use std::time::Duration;
 
-use crate::catalogue::Device;
+use crate::backend::catalogue::Device;
 
 /// Bounds a single HEAD request. Generous for a CDN, short enough that a failed link is reported rather than
 /// appearing to hang.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The client `check` is run with in the build.
+/// The client the check runs with against the publisher.
 pub fn default_client() -> reqwest::Result<reqwest::Client> {
     reqwest::Client::builder().timeout(REQUEST_TIMEOUT).build()
 }
@@ -49,7 +51,7 @@ impl fmt::Display for Failure<'_> {
     }
 }
 
-/// Renders failures for build output, or an empty string when there were none.
+/// Renders failures for the check's output, or an empty string when there were none.
 pub fn report(failures: &[Failure<'_>]) -> String {
     if failures.is_empty() {
         return String::new();
@@ -67,8 +69,8 @@ pub fn report(failures: &[Failure<'_>]) -> String {
 /// Requests each distinct address under `base` once and returns every one that did not resolve, in the order
 /// the addresses first appear. An empty result means every address resolved.
 ///
-/// `base` is `ADDRESS_PREFIX` in the build. Tests pass a local server instead, so the request code that runs in
-/// the build is the code the tests run.
+/// `base` is the publisher's images directory for the real check. Tests pass a local server instead, so the
+/// request code that checks the publisher is the code the tests run.
 pub async fn check<'a>(
     client: &reqwest::Client,
     base: &str,
@@ -97,7 +99,7 @@ pub async fn check<'a>(
 fn address_groups<'a>(base: &str, devices: &'a [Device]) -> Vec<(String, Vec<&'a Device>)> {
     let mut groups: Vec<(String, Vec<&'a Device>)> = Vec::new();
     for device in devices {
-        let address = format!("{base}{}", device.image_name());
+        let address = device.address_under(base);
         match groups.iter_mut().find(|(a, _)| *a == address) {
             Some((_, members)) => members.push(device),
             None => groups.push((address, vec![device])),
@@ -109,12 +111,9 @@ fn address_groups<'a>(base: &str, devices: &'a [Device]) -> Vec<(String, Vec<&'a
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalogue::{ADDRESS_PREFIX, DEVICES};
+    use crate::backend::catalogue::{ADDRESS_PREFIX, DEVICES};
+    use crate::testing::test_server::{Reply, client, image_path, serve_logged};
     use std::collections::HashMap;
-    use std::io::{Read, Write};
-    use std::net::{TcpListener, TcpStream};
-    use std::sync::{Arc, Mutex};
-    use std::thread;
 
     /// A small catalogue for the check to run over. Two of its three entries share an address, so every test
     /// exercises the grouping rather than assuming one device means one request.
@@ -134,122 +133,54 @@ mod tests {
         ]
     }
 
-    /// The path a device's address takes under the local server's base.
-    fn path_of(d: &Device) -> String {
-        format!("/downloads/images/{}", d.image_name())
-    }
-
-    /// A local HTTP server answering HEAD requests with the status configured for each path, and recording the
-    /// requests it was sent so a test can assert on them as well as on the outcome.
-    struct Server {
-        base: String,
-        requests: Arc<Mutex<Vec<String>>>,
-    }
-
-    impl Server {
-        fn requests(&self) -> Vec<String> {
-            self.requests.lock().unwrap().clone()
+    /// The routes a server needs to answer every device in `devices` with 200, except the devices in `failing`,
+    /// which answer with their given status.
+    fn routes(devices: &[Device], failing: &[(&Device, u16)]) -> HashMap<String, Reply> {
+        let mut routes: HashMap<String, Reply> = devices
+            .iter()
+            .map(|d| (image_path(&d.image_name()), Reply::Status(200)))
+            .collect();
+        for (device, status) in failing {
+            routes.insert(image_path(&device.image_name()), Reply::Status(*status));
         }
+        routes
     }
 
-    fn serve(status: HashMap<String, u16>) -> Server {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind a loopback port");
-        let port = listener.local_addr().expect("local address").port();
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let log = Arc::clone(&requests);
-        let status = Arc::new(status);
-
-        thread::spawn(move || {
-            for stream in listener.incoming().flatten() {
-                let status = Arc::clone(&status);
-                let log = Arc::clone(&log);
-                thread::spawn(move || answer(stream, &status, &log));
-            }
-        });
-
-        Server {
-            base: format!("http://127.0.0.1:{port}/downloads/images/"),
-            requests,
-        }
-    }
-
-    fn answer(mut stream: TcpStream, status: &HashMap<String, u16>, log: &Mutex<Vec<String>>) {
-        let mut head = Vec::new();
-        let mut buf = [0u8; 1024];
-        while !head.windows(4).any(|w| w == b"\r\n\r\n") {
-            match stream.read(&mut buf) {
-                Ok(0) | Err(_) => return,
-                Ok(n) => head.extend_from_slice(&buf[..n]),
-            }
-        }
-
-        let text = String::from_utf8_lossy(&head);
-        let line = text.lines().next().unwrap_or_default();
-        let mut parts = line.split(' ');
-        let method = parts.next().unwrap_or_default();
-        let path = parts.next().unwrap_or_default();
-        log.lock().unwrap().push(format!("{method} {path}"));
-
-        let code = status.get(path).copied().unwrap_or(200);
-        let reason = match code {
-            200 => "OK",
-            404 => "Not Found",
-            500 => "Internal Server Error",
-            _ => "Unknown",
-        };
-        let response =
-            format!("HTTP/1.1 {code} {reason}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
-        let _ = stream.write_all(response.as_bytes());
-    }
-
-    /// A client that does not route loopback requests through a proxy from the environment, and that gives up
-    /// quickly, since everything it talks to here is local.
-    fn test_client() -> reqwest::Client {
-        reqwest::Client::builder()
-            .no_proxy()
-            .timeout(Duration::from_secs(2))
-            .build()
-            .expect("client")
-    }
-
-    /// The passing half of task 3.5: a run in which every address resolves passes. A check that only ever reports
+    /// The passing half of the check: a run in which every address resolves passes. A check that only ever reports
     /// failures is indistinguishable from one wired up wrongly.
     #[tokio::test]
     async fn passes_when_every_address_resolves() {
-        let server = serve(HashMap::new());
         let devices = fixture_devices();
+        let (base, requests) = serve_logged(routes(&devices, &[]));
 
-        let failures = check(&test_client(), &server.base, &devices).await;
+        let failures = check(&client(), &base, &devices).await;
         assert!(failures.is_empty(), "{}", report(&failures));
         assert_eq!(report(&failures), "");
 
-        // Three devices, two distinct addresses, two requests.
-        let requests = server.requests();
+        // Three devices, two distinct addresses, two requests, each a HEAD.
+        let requests = requests.lock().unwrap().clone();
         assert_eq!(requests.len(), 2, "requests: {requests:?}");
         for request in &requests {
             assert!(
                 request.starts_with("HEAD "),
-                "the check issued {request:?}; design.md specifies HEAD"
+                "the check issued {request:?}, but a HEAD request is what checks an address without fetching it"
             );
         }
     }
 
-    /// The failing half of task 3.5: the failure names the entry and the address that stopped resolving. A build
-    /// log saying "link check failed" sends a reader to grep; one naming the address and the board does not.
+    /// The failure names the entry and the address that stopped resolving. A log saying only "link check failed"
+    /// sends a reader to grep; one naming the address and the board does not.
     #[tokio::test]
     async fn names_the_entry_and_the_address_that_stopped_resolving() {
         let devices = fixture_devices();
         let broken = &devices[1];
-        let server = serve(HashMap::from([(path_of(broken), 404)]));
+        let (base, _) = serve_logged(routes(&devices, &[(broken, 404)]));
 
-        let failures = check(&test_client(), &server.base, &devices).await;
+        let failures = check(&client(), &base, &devices).await;
         assert_eq!(failures.len(), 1, "{}", report(&failures));
 
         let failure = &failures[0];
-        assert_eq!(
-            failure.address,
-            format!("{}{}", server.base, broken.image_name())
-        );
+        assert_eq!(failure.address, broken.address_under(&base));
         assert!(
             failure.reason.contains("404"),
             "reason {:?} keeps the server's status",
@@ -283,7 +214,7 @@ mod tests {
         assert!(
             failures
                 .iter()
-                .all(|f| f.address != format!("{}{}", server.base, devices[0].image_name()))
+                .all(|f| f.address != devices[0].address_under(&base))
         );
     }
 
@@ -292,12 +223,9 @@ mod tests {
     #[tokio::test]
     async fn reports_every_address_that_does_not_resolve() {
         let devices = fixture_devices();
-        let server = serve(HashMap::from([
-            (path_of(&devices[0]), 404),
-            (path_of(&devices[1]), 500),
-        ]));
+        let (base, _) = serve_logged(routes(&devices, &[(&devices[0], 404), (&devices[1], 500)]));
 
-        let failures = check(&test_client(), &server.base, &devices).await;
+        let failures = check(&client(), &base, &devices).await;
         assert_eq!(failures.len(), 2, "{}", report(&failures));
 
         let text = report(&failures);
@@ -320,12 +248,7 @@ mod tests {
     async fn reports_an_unreachable_server_rather_than_passing() {
         // Port 1 on loopback has nothing listening, so the connection is refused at once.
         let devices = fixture_devices();
-        let failures = check(
-            &test_client(),
-            "http://127.0.0.1:1/downloads/images/",
-            &devices,
-        )
-        .await;
+        let failures = check(&client(), "http://127.0.0.1:1/images/", &devices).await;
 
         assert_eq!(
             failures.len(),

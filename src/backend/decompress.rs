@@ -15,7 +15,7 @@ use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio_util::sync::CancellationToken;
 
-use crate::fetch::partial_path;
+use crate::backend::fetch::partial_path;
 
 /// The size of the buffer the decoder writes through. Peak memory is this plus the decoder's own dictionary, which
 /// does not grow with the image.
@@ -45,14 +45,16 @@ pub enum DecompressError {
 
 /// Decompresses the xz file at `input` to `output`. The output appears only if the whole stream decompressed; any
 /// failure removes the partial file, so nothing is presented as a flashable image. A cancellation counts as a
-/// failure here: the decode stops and the partial file is removed.
+/// failure here: the decode stops and the partial file is removed. `progress` receives the running total of
+/// bytes written each time a block of output lands.
 pub async fn decompress(
     input: &Path,
     output: &Path,
     cancel: &CancellationToken,
+    progress: impl FnMut(u64),
 ) -> Result<Decompression, DecompressError> {
     let partial = partial_path(output);
-    match stream_to(input, &partial, cancel).await {
+    match stream_to(input, &partial, cancel, progress).await {
         Ok(bytes) => {
             tokio::fs::rename(&partial, output)
                 .await
@@ -71,12 +73,13 @@ pub async fn decompress(
 
 /// Decodes `input` into `partial`, returning how many bytes were written.
 ///
-/// Every read is raced against the cancellation token, as the 0.4 spike proved the decode can be, and the
-/// token is checked once more after the stream ends so a cancel that lands during the last read still counts.
+/// Every read is raced against the cancellation token, so a cancel stops the decode mid-stream. The token is
+/// checked once more after the stream ends so a cancel that lands during the last read still counts.
 async fn stream_to(
     input: &Path,
     partial: &Path,
     cancel: &CancellationToken,
+    mut progress: impl FnMut(u64),
 ) -> Result<u64, DecompressError> {
     let cancelled = || DecompressError::Cancelled {
         file: filename(input),
@@ -121,6 +124,7 @@ async fn stream_to(
                 source,
             })?;
         written += n as u64;
+        progress(written);
     }
     out.sync_all().await.map_err(|source| DecompressError::Io {
         path: partial.to_path_buf(),
@@ -138,8 +142,10 @@ async fn stream_to(
     Ok(written)
 }
 
-/// The reason a decode failed. liblzma reports input that ends before the end of the xz stream as a buffer error,
-/// which arrives here as `OutOfMemory`, so that kind is read as truncation rather than shown as a memory failure.
+/// The reason a decode failed. When the xz data ends before the stream is complete, liblzma returns a buffer error
+/// (`LZMA_BUF_ERROR`). The xz decoder in `compression-codecs` (`src/xz2/mod.rs`) reports that status as
+/// `io::ErrorKind::OutOfMemory`, so that kind is read as truncation. A genuine allocation failure would arrive as
+/// the same kind and be reported as truncation too, which is why the truncated case is the one the tests pin.
 fn stream_reason(err: &io::Error) -> String {
     if err.kind() == io::ErrorKind::OutOfMemory {
         "the xz data ends before the stream is complete, so the image is truncated".to_owned()
@@ -157,24 +163,10 @@ fn filename(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use liblzma::write::XzEncoder;
-    use std::io::Write;
+    use crate::testing::test_support::{payload, xz};
     use tempfile::tempdir;
 
-    /// Three megabytes, larger than the buffer, so the stream takes several reads.
-    fn payload() -> Vec<u8> {
-        (0..3_000_000u32)
-            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
-            .collect()
-    }
-
-    fn xz(bytes: &[u8]) -> Vec<u8> {
-        let mut encoder = XzEncoder::new(Vec::new(), 6);
-        encoder.write_all(bytes).unwrap();
-        encoder.finish().unwrap()
-    }
-
-    /// Task 6.1: a complete stream appears at the output path with its decompressed contents.
+    /// A complete stream appears at the output path with its decompressed contents.
     #[tokio::test]
     async fn a_complete_stream_appears_at_the_output_path() {
         let image = payload();
@@ -183,7 +175,7 @@ mod tests {
         let output = dir.path().join("image.img");
         std::fs::write(&input, xz(&image)).unwrap();
 
-        let done = decompress(&input, &output, &CancellationToken::new())
+        let done = decompress(&input, &output, &CancellationToken::new(), |_| {})
             .await
             .unwrap();
 
@@ -192,7 +184,7 @@ mod tests {
         assert!(!partial_path(&output).exists());
     }
 
-    /// Task 6.2: a stream cut short fails with the reason shown, and nothing is left at either name.
+    /// A stream cut short fails with the reason shown, and nothing is left at either name.
     #[tokio::test]
     async fn a_truncated_stream_fails_and_leaves_nothing() {
         let compressed = xz(&payload());
@@ -201,7 +193,7 @@ mod tests {
         let output = dir.path().join("image.img");
         std::fs::write(&input, &compressed[..compressed.len() / 2]).unwrap();
 
-        let err = decompress(&input, &output, &CancellationToken::new())
+        let err = decompress(&input, &output, &CancellationToken::new(), |_| {})
             .await
             .unwrap_err();
 
@@ -211,7 +203,7 @@ mod tests {
         assert!(!partial_path(&output).exists());
     }
 
-    /// Task 6.2: a corrupt stream fails with the reason shown, and nothing is left at either name.
+    /// A stream with corrupted bytes fails with the reason shown, and nothing is left at either name.
     #[tokio::test]
     async fn a_corrupt_stream_fails_and_leaves_nothing() {
         let mut compressed = xz(&payload());
@@ -224,7 +216,7 @@ mod tests {
         let output = dir.path().join("image.img");
         std::fs::write(&input, &compressed).unwrap();
 
-        let err = decompress(&input, &output, &CancellationToken::new())
+        let err = decompress(&input, &output, &CancellationToken::new(), |_| {})
             .await
             .unwrap_err();
 
@@ -233,11 +225,9 @@ mod tests {
         assert!(!partial_path(&output).exists());
     }
 
-    /// Task 7.3: cancelling a decode in progress stops it and leaves nothing at either name.
-    ///
-    /// A long, highly compressible stream is used so the decode is still running when the token fires: zeros
-    /// decode far faster than the noise payload, but 128 MiB of them still takes far longer than the 50 ms
-    /// before the cancel.
+    /// A cancel issued once output has been written stops the decode and leaves nothing at either name. The cancel
+    /// is issued from the progress callback, so it is certain to land mid-decode. The stream is long enough that
+    /// many reads follow the first write.
     #[tokio::test]
     async fn a_cancelled_decode_leaves_nothing() {
         let image = vec![0u8; 128 * 1024 * 1024];
@@ -247,12 +237,14 @@ mod tests {
         std::fs::write(&input, xz(&image)).unwrap();
         let cancel = CancellationToken::new();
         let c = cancel.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            c.cancel();
-        });
 
-        let err = decompress(&input, &output, &cancel).await.unwrap_err();
+        let err = decompress(&input, &output, &cancel, |written| {
+            if written > 0 {
+                c.cancel();
+            }
+        })
+        .await
+        .unwrap_err();
 
         assert!(matches!(err, DecompressError::Cancelled { .. }), "{err}");
         assert!(!output.exists(), "the output path must hold nothing");
@@ -272,7 +264,9 @@ mod tests {
         let cancel = CancellationToken::new();
         cancel.cancel();
 
-        let err = decompress(&input, &output, &cancel).await.unwrap_err();
+        let err = decompress(&input, &output, &cancel, |_| {})
+            .await
+            .unwrap_err();
 
         assert!(matches!(err, DecompressError::Cancelled { .. }), "{err}");
         assert!(!output.exists());
