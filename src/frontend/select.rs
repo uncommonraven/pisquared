@@ -7,7 +7,7 @@
 
 use crossterm::event::{Event, KeyCode, KeyEventKind};
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::widgets::{Block, List, ListState, Paragraph, Wrap};
 
@@ -49,13 +49,13 @@ pub fn update(model: &mut Model, event: &Event) {
     }
 }
 
-pub fn view(model: &Model, frame: &mut Frame) {
+pub fn view(model: &Model, frame: &mut Frame, area: Rect) {
     let [list_area, detail_area, footer_area] = Layout::vertical([
         Constraint::Fill(1),
         Constraint::Length(10),
         Constraint::Length(3),
     ])
-    .areas(frame.area());
+    .areas(area);
 
     let items: Vec<String> = DEVICES
         .iter()
@@ -139,7 +139,9 @@ mod tests {
 
     fn screen(model: &Model) -> String {
         let mut terminal = Terminal::new(TestBackend::new(WIDTH, HEIGHT)).unwrap();
-        terminal.draw(|frame| view(model, frame)).unwrap();
+        terminal
+            .draw(|frame| view(model, frame, frame.area()))
+            .unwrap();
         let buffer = terminal.backend().buffer();
         (0..HEIGHT)
             .map(|y| {

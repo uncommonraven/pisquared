@@ -12,10 +12,10 @@ is implemented in Rust.
 When complete, one interface walks you through:
 
 - [x] choosing the Raspberry Pi device you own,
-- [ ] choosing PREFERENCES: orchestrator (herdr), harness (pi, opencode, or Claude Code), and sandbox (nono),
+- [x] choosing PREFERENCES: orchestrator (herdr), harness (pi, opencode, or Claude Code), and sandbox (nono),
 - [ ] entering CREDENTIALS: your Wi-Fi network name and passkey, and a Tailscale auth key,
 - [ ] choosing the drive to flash,
-- [ ] confirming the choices,
+- [x] confirming the choices,
 - [x] downloading the DietPi image for the device and checking it against its published checksum and signature,
 - [x] decompressing it,
 - [ ] writing your choices into the image's boot partition,

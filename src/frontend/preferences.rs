@@ -62,6 +62,15 @@ impl Model {
         }
     }
 
+    /// The position of the current screen among the preferences screens, from the first.
+    pub fn page(&self) -> usize {
+        match self.screen {
+            Screen::Orchestrator => 0,
+            Screen::Harnesses => 1,
+            Screen::Sandboxes => 2,
+        }
+    }
+
     /// Goes back to the previous screen. Reports false on the first screen, where going back leaves the preferences.
     pub fn back(&mut self) -> bool {
         match self.screen.previous() {
@@ -207,9 +216,9 @@ pub fn update(model: &mut Model, event: &Event) {
     }
 }
 
-pub fn view(model: &Model, frame: &mut Frame) {
+pub fn view(model: &Model, frame: &mut Frame, area: Rect) {
     let [menu_area, footer_area] =
-        Layout::vertical([Constraint::Fill(1), Constraint::Length(3)]).areas(frame.area());
+        Layout::vertical([Constraint::Fill(1), Constraint::Length(3)]).areas(area);
 
     match model.screen {
         Screen::Orchestrator => {
@@ -280,7 +289,9 @@ mod tests {
 
     fn screen(model: &Model) -> String {
         let mut terminal = Terminal::new(TestBackend::new(WIDTH, HEIGHT)).unwrap();
-        terminal.draw(|frame| view(model, frame)).unwrap();
+        terminal
+            .draw(|frame| view(model, frame, frame.area()))
+            .unwrap();
         let buffer = terminal.backend().buffer();
         (0..HEIGHT)
             .map(|y| {

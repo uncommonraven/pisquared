@@ -1,26 +1,31 @@
-//! The interface as a whole: choosing a device, choosing its preferences, confirming them, then obtaining its image
-//! while showing progress, then the outcome.
+//! The interface as a whole: an opening splash, choosing a device, choosing its preferences, confirming them, then
+//! obtaining its image while showing progress, then the outcome.
 //!
-//! Before a run starts the device selection view has the screen, then the preferences view once a device is chosen,
+//! The splash opens the interface with a choice of Begin or Quit. Before a run starts the device selection view has the
+//! screen once the splash is passed, then the preferences view once a device is chosen,
 //! then the confirmation view once the preferences are complete. Only Enter on the confirmation view starts the run,
 //! so nothing is downloaded until the operator has seen their choices. While a run is in progress the screen shows
 //! what it is doing and Esc or Ctrl-C cancels it. Once the run has ended the screen shows its outcome and its log, and
 //! Esc or Ctrl-C quits.
 
+use std::cmp::Ordering;
 use std::path::PathBuf;
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout};
+use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::style::{Color, Style};
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Gauge, Paragraph, Wrap};
 
 use crate::backend::catalogue::Device;
 use crate::backend::fetch::Verification;
 use crate::backend::preferences::Preferences;
 use crate::backend::run::{Activity, Job, Obtained, RunError};
-use crate::frontend::{preferences, select};
+use crate::frontend::{preferences, select, splash};
 
 pub struct Model {
+    splash: Option<splash::Model>,
     select: select::Model,
     choosing: Option<Choosing>,
     confirming: Option<Confirming>,
@@ -49,6 +54,7 @@ enum Run {
 impl Model {
     pub fn new(output_dir: PathBuf) -> Self {
         Self {
+            splash: Some(splash::Model::default()),
             select: select::Model::default(),
             choosing: None,
             confirming: None,
@@ -78,6 +84,16 @@ pub fn update(model: &mut Model, event: &Event) -> bool {
         }
         Some(Run::Ended { .. }) => interrupt,
         None => {
+            if let Some(splash) = model.splash.as_mut() {
+                return match splash::update(splash, event) {
+                    Some(splash::Choice::Begin) => {
+                        model.splash = None;
+                        false
+                    }
+                    Some(splash::Choice::Quit) => true,
+                    None => false,
+                };
+            }
             if let Some(confirming) = model.confirming.take() {
                 return confirm(model, confirming, key);
             }
@@ -158,15 +174,67 @@ pub fn tick(model: &mut Model) {
     }
 }
 
+/// The sections in order, each with its name and how many pages it has.
+const SECTIONS: [(&str, usize); 4] = [
+    ("Device", 1),
+    ("Preferences", 3),
+    ("Confirm", 1),
+    ("Download", 1),
+];
+
+/// The section the operator is in, and the page within it, both counted from the first.
+fn position(model: &Model) -> (usize, usize) {
+    match (&model.run, &model.confirming, &model.choosing) {
+        (Some(_), _, _) => (3, 0),
+        (None, Some(_), _) => (2, 0),
+        (None, None, Some(choosing)) => (1, choosing.menus.page()),
+        (None, None, None) => (0, 0),
+    }
+}
+
+/// Every section in order, with those before the current one marked as done. A current section with more than one
+/// page shows its position beside its name, such as "Preferences 2/3".
+fn progress(model: &Model) -> Line<'static> {
+    let (current, page) = position(model);
+    let mut spans = Vec::new();
+    for (index, (name, pages)) in SECTIONS.iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::styled(" › ", Style::new().dim()));
+        }
+        let (label, style) = match index.cmp(&current) {
+            Ordering::Less => (format!("✓ {name}"), Style::new().fg(Color::Green)),
+            Ordering::Equal if *pages > 1 => (
+                format!("{name} {}/{pages}", page + 1),
+                Style::new().bold().reversed(),
+            ),
+            Ordering::Equal => (name.to_string(), Style::new().bold().reversed()),
+            Ordering::Greater => (name.to_string(), Style::new().dim()),
+        };
+        spans.push(Span::styled(label, style));
+    }
+    Line::from(spans)
+}
+
 pub fn view(model: &Model, frame: &mut Frame) {
+    if let Some(splash) = &model.splash {
+        splash::view(splash, frame, frame.area());
+        return;
+    }
+
+    let [progress_area, body_area] =
+        Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(frame.area());
+    frame.render_widget(Paragraph::new(progress(model)), progress_area);
+
     match &model.run {
         None => match (&model.confirming, &model.choosing) {
-            (Some(confirming), _) => view_confirming(confirming, frame),
-            (None, Some(choosing)) => preferences::view(&choosing.menus, frame),
-            (None, None) => select::view(&model.select, frame),
+            (Some(confirming), _) => view_confirming(confirming, frame, body_area),
+            (None, Some(choosing)) => preferences::view(&choosing.menus, frame, body_area),
+            (None, None) => select::view(&model.select, frame, body_area),
         },
-        Some(Run::Active { job, preferences }) => view_active(job.current(), preferences, frame),
-        Some(Run::Ended { outcome, log }) => view_ended(outcome, log, frame),
+        Some(Run::Active { job, preferences }) => {
+            view_active(job.current(), preferences, frame, body_area)
+        }
+        Some(Run::Ended { outcome, log }) => view_ended(outcome, log, frame, body_area),
     }
 }
 
@@ -193,14 +261,14 @@ fn checksum_outcome(verification: &Verification) -> String {
     }
 }
 
-fn view_active(activity: Activity, preferences: &Preferences, frame: &mut Frame) {
+fn view_active(activity: Activity, preferences: &Preferences, frame: &mut Frame, area: Rect) {
     let [status_area, progress_area, preferences_area, hint_area] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Length(1),
     ])
-    .areas(frame.area());
+    .areas(area);
 
     frame.render_widget(Paragraph::new(describe(activity)), status_area);
     frame.render_widget(
@@ -216,7 +284,7 @@ fn view_active(activity: Activity, preferences: &Preferences, frame: &mut Frame)
     );
 }
 
-fn view_confirming(confirming: &Confirming, frame: &mut Frame) {
+fn view_confirming(confirming: &Confirming, frame: &mut Frame, area: Rect) {
     let device = confirming.device;
     let mut lines = vec![
         "Confirm your choices. Nothing has been downloaded yet.".to_owned(),
@@ -237,13 +305,13 @@ fn view_confirming(confirming: &Confirming, frame: &mut Frame) {
 
     frame.render_widget(
         Paragraph::new(lines.join("\n")).wrap(Wrap { trim: true }),
-        frame.area(),
+        area,
     );
 }
 
-fn view_ended(outcome: &str, log: &str, frame: &mut Frame) {
+fn view_ended(outcome: &str, log: &str, frame: &mut Frame, area: Rect) {
     let [outcome_area, log_area] =
-        Layout::vertical([Constraint::Length(4), Constraint::Fill(1)]).areas(frame.area());
+        Layout::vertical([Constraint::Length(4), Constraint::Fill(1)]).areas(area);
 
     frame.render_widget(
         Paragraph::new(outcome).wrap(Wrap { trim: true }),
@@ -305,6 +373,42 @@ mod tests {
         Event::Key(KeyEvent::new(code, modifiers))
     }
 
+    /// A model with the splash passed by choosing Begin, so the tests start on the device screen.
+    fn started() -> Model {
+        let mut model = Model::new(PathBuf::from("."));
+        update(&mut model, &key(KeyCode::Enter, KeyModifiers::NONE));
+        model
+    }
+
+    #[test]
+    fn the_splash_comes_first_and_quit_ends_the_interface() {
+        let mut model = Model::new(PathBuf::from("."));
+
+        assert!(model.splash.is_some(), "the splash opens the interface");
+        assert!(!update(
+            &mut model,
+            &key(KeyCode::Char(' '), KeyModifiers::NONE)
+        ));
+        assert!(model.splash.is_some(), "other keys do not pass the splash");
+        assert!(model.select.chosen().is_none());
+
+        update(&mut model, &key(KeyCode::Down, KeyModifiers::NONE));
+        assert!(update(&mut model, &key(KeyCode::Enter, KeyModifiers::NONE)));
+    }
+
+    #[test]
+    fn begin_passes_the_splash_to_the_device_screen() {
+        let mut model = Model::new(PathBuf::from("."));
+
+        assert!(!update(
+            &mut model,
+            &key(KeyCode::Enter, KeyModifiers::NONE)
+        ));
+
+        assert!(model.splash.is_none());
+        assert!(model.run.is_none());
+    }
+
     #[test]
     fn the_progress_line_shows_bytes_and_percentage_of_the_declared_total() {
         let mib = 1024 * 1024;
@@ -327,7 +431,7 @@ mod tests {
 
     #[test]
     fn space_picks_a_device_and_enter_continues_without_starting_it() {
-        let mut model = Model::new(PathBuf::from("."));
+        let mut model = started();
 
         assert!(!update(
             &mut model,
@@ -349,7 +453,7 @@ mod tests {
 
     #[test]
     fn enter_without_a_pick_does_nothing_and_escape_quits() {
-        let mut model = Model::new(PathBuf::from("."));
+        let mut model = started();
 
         assert!(!update(
             &mut model,
@@ -386,7 +490,7 @@ mod tests {
 
     #[test]
     fn a_chosen_device_opens_its_preferences_and_an_incomplete_choice_starts_nothing() {
-        let mut model = Model::new(PathBuf::from("."));
+        let mut model = started();
         update(&mut model, &key(KeyCode::Char(' '), KeyModifiers::NONE));
         update(&mut model, &key(KeyCode::Enter, KeyModifiers::NONE));
         update(&mut model, &key(KeyCode::Enter, KeyModifiers::NONE));
@@ -405,7 +509,7 @@ mod tests {
 
     #[test]
     fn complete_preferences_show_a_confirmation_that_starts_nothing() {
-        let mut model = Model::new(PathBuf::from("."));
+        let mut model = started();
         update(&mut model, &key(KeyCode::Char(' '), KeyModifiers::NONE));
         update(&mut model, &key(KeyCode::Enter, KeyModifiers::NONE));
         update(&mut model, &key(KeyCode::Enter, KeyModifiers::NONE));
@@ -423,7 +527,7 @@ mod tests {
 
     #[test]
     fn escape_on_the_confirmation_returns_to_the_preferences_and_keeps_them() {
-        let mut model = Model::new(PathBuf::from("."));
+        let mut model = started();
         update(&mut model, &key(KeyCode::Char(' '), KeyModifiers::NONE));
         update(&mut model, &key(KeyCode::Enter, KeyModifiers::NONE));
         update(&mut model, &key(KeyCode::Enter, KeyModifiers::NONE));
@@ -447,7 +551,7 @@ mod tests {
 
     #[test]
     fn the_confirmation_shows_the_choices_before_the_download() {
-        let mut model = Model::new(PathBuf::from("."));
+        let mut model = started();
         update(&mut model, &key(KeyCode::Char(' '), KeyModifiers::NONE));
         update(&mut model, &key(KeyCode::Enter, KeyModifiers::NONE));
         update(&mut model, &key(KeyCode::Enter, KeyModifiers::NONE));
@@ -485,7 +589,7 @@ mod tests {
 
     #[test]
     fn left_goes_back_a_stage_from_the_preferences_and_the_confirmation() {
-        let mut model = Model::new(PathBuf::from("."));
+        let mut model = started();
         update(&mut model, &key(KeyCode::Char(' '), KeyModifiers::NONE));
         update(&mut model, &key(KeyCode::Enter, KeyModifiers::NONE));
         update(&mut model, &key(KeyCode::Enter, KeyModifiers::NONE));
@@ -513,8 +617,27 @@ mod tests {
     }
 
     #[test]
+    fn the_progress_line_marks_the_pages_already_done() {
+        let mut model = started();
+        update(&mut model, &key(KeyCode::Char(' '), KeyModifiers::NONE));
+        update(&mut model, &key(KeyCode::Enter, KeyModifiers::NONE));
+        update(&mut model, &key(KeyCode::Char(' '), KeyModifiers::NONE));
+        update(&mut model, &key(KeyCode::Enter, KeyModifiers::NONE));
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 20)).unwrap();
+        terminal.draw(|frame| view(&model, frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let progress: String = (0..120).map(|x| buffer[(x, 0)].symbol()).collect();
+
+        assert!(
+            progress.contains("✓ Device › Preferences 2/3 › Confirm › Download"),
+            "{progress}"
+        );
+    }
+
+    #[test]
     fn control_c_quits_before_a_run() {
-        let mut model = Model::new(PathBuf::from("."));
+        let mut model = started();
 
         assert!(update(
             &mut model,

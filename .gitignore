@@ -4,3 +4,4 @@ skills-lock.json
 
 # Build output from `cargo build`
 /target
+docs/*
