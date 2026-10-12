@@ -16,6 +16,7 @@ liblzma = { version = "0.4.8", features = ["static"] }
 pgp = "=0.21.0"
 ratatui = "0.30.2"
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls"] }
+rust_iso3166 = "0.2.0"
 sha2 = "0.10"
 tempfile = "3.27.0"
 thiserror = "2.0.21"

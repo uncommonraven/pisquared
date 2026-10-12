@@ -267,7 +267,7 @@ fn footer(model: &Model) -> String {
     } else {
         match model.screen.next() {
             Some(next) => format!("Enter continues to {}.", next.name()),
-            None => "Enter continues to confirm your choices.".to_owned(),
+            None => "Enter continues to the network settings.".to_owned(),
         }
     };
     format!("{status}\nUp and down move, Space picks, Enter continues. Left goes back. Esc quits.")

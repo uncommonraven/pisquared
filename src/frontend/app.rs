@@ -1,10 +1,10 @@
-//! The interface as a whole: an opening splash, choosing a device, choosing its preferences, confirming them, then
-//! obtaining its image while showing progress, then the outcome.
+//! The interface as a whole: an opening splash, choosing a device, choosing its preferences, entering its Wi-Fi network,
+//! confirming the choices, then obtaining its image while showing progress, then the outcome.
 //!
 //! The splash opens the interface with a choice of Begin or Quit. Before a run starts the device selection view has the
-//! screen once the splash is passed, then the preferences view once a device is chosen,
-//! then the confirmation view once the preferences are complete. Only Enter on the confirmation view starts the run,
-//! so nothing is downloaded until the operator has seen their choices. While a run is in progress the screen shows
+//! screen once the splash is passed, then the preferences view once a device is chosen, then the network view once the
+//! preferences are complete, then the confirmation view once the network is valid. Only Enter on the confirmation view
+//! starts the run, so nothing is downloaded until the operator has seen their choices. While a run is in progress the screen shows
 //! what it is doing and Esc or Ctrl-C cancels it. Once the run has ended the screen shows its outcome and its log, and
 //! Esc or Ctrl-C quits.
 
@@ -20,14 +20,16 @@ use ratatui::widgets::{Block, Gauge, Paragraph, Wrap};
 
 use crate::backend::catalogue::Device;
 use crate::backend::fetch::Verification;
+use crate::backend::network::Wifi;
 use crate::backend::preferences::Preferences;
 use crate::backend::run::{Activity, Job, Obtained, RunError};
-use crate::frontend::{preferences, select, splash};
+use crate::frontend::{network, preferences, select, splash};
 
 pub struct Model {
     splash: Option<splash::Model>,
     select: select::Model,
     choosing: Option<Choosing>,
+    credentialing: Option<Credentialing>,
     confirming: Option<Confirming>,
     output_dir: PathBuf,
     run: Option<Run>,
@@ -39,11 +41,22 @@ struct Choosing {
     menus: preferences::Model,
 }
 
-/// A chosen device whose complete preferences are shown for the operator to confirm before anything is downloaded.
+/// A chosen device whose complete preferences are followed by its Wi-Fi network, entered before anything is downloaded.
+struct Credentialing {
+    device: &'static Device,
+    menus: preferences::Model,
+    preferences: Preferences,
+    network: network::Model,
+}
+
+/// A chosen device whose complete preferences and valid network are shown for the operator to confirm before anything
+/// is downloaded.
 struct Confirming {
     device: &'static Device,
     menus: preferences::Model,
     preferences: Preferences,
+    network: network::Model,
+    wifi: Wifi,
 }
 
 enum Run {
@@ -57,6 +70,7 @@ impl Model {
             splash: Some(splash::Model::default()),
             select: select::Model::default(),
             choosing: None,
+            credentialing: None,
             confirming: None,
             output_dir,
             run: None,
@@ -97,6 +111,9 @@ pub fn update(model: &mut Model, event: &Event) -> bool {
             if let Some(confirming) = model.confirming.take() {
                 return confirm(model, confirming, key);
             }
+            if let Some(credentialing) = model.credentialing.take() {
+                return credential(model, credentialing, key);
+            }
             if interrupt {
                 return true;
             }
@@ -104,10 +121,11 @@ pub fn update(model: &mut Model, event: &Event) -> bool {
                 match key.code {
                     KeyCode::Enter => match choosing.menus.enter() {
                         Some(preferences) => {
-                            model.confirming = Some(Confirming {
+                            model.credentialing = Some(Credentialing {
                                 device: choosing.device,
                                 menus: choosing.menus,
                                 preferences,
+                                network: network::Model::default(),
                             });
                         }
                         None => model.choosing = Some(choosing),
@@ -137,7 +155,42 @@ pub fn update(model: &mut Model, event: &Event) -> bool {
     }
 }
 
-/// Applies a key on the confirmation view: Enter starts the run, Esc returns to the preferences with their choices
+/// Applies a key on the Network page: Enter continues once every field is valid, Left or Esc goes back to the
+/// preferences with the choices kept, and Ctrl-C quits. Any other key edits the page.
+fn credential(model: &mut Model, mut credentialing: Credentialing, key: &KeyEvent) -> bool {
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        return true;
+    }
+    match key.code {
+        KeyCode::Enter => match credentialing.network.wifi() {
+            Some(wifi) => {
+                credentialing.network.leave();
+                model.confirming = Some(Confirming {
+                    device: credentialing.device,
+                    menus: credentialing.menus,
+                    preferences: credentialing.preferences,
+                    network: credentialing.network,
+                    wifi,
+                });
+            }
+            None => model.credentialing = Some(credentialing),
+        },
+        KeyCode::Esc | KeyCode::Left => {
+            credentialing.network.leave();
+            model.choosing = Some(Choosing {
+                device: credentialing.device,
+                menus: credentialing.menus,
+            });
+        }
+        _ => {
+            network::update(&mut credentialing.network, key);
+            model.credentialing = Some(credentialing);
+        }
+    }
+    false
+}
+
+/// Applies a key on the confirmation view: Enter starts the run, Esc or Left returns to the Network page with its values
 /// kept, and Ctrl-C quits. Any other key leaves the confirmation as it is.
 fn confirm(model: &mut Model, confirming: Confirming, key: &KeyEvent) -> bool {
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -151,9 +204,11 @@ fn confirm(model: &mut Model, confirming: Confirming, key: &KeyEvent) -> bool {
             });
         }
         KeyCode::Esc | KeyCode::Left => {
-            model.choosing = Some(Choosing {
+            model.credentialing = Some(Credentialing {
                 device: confirming.device,
                 menus: confirming.menus,
+                preferences: confirming.preferences,
+                network: confirming.network,
             });
         }
         _ => model.confirming = Some(confirming),
@@ -175,20 +230,27 @@ pub fn tick(model: &mut Model) {
 }
 
 /// The sections in order, each with its name and how many pages it has.
-const SECTIONS: [(&str, usize); 4] = [
+const SECTIONS: [(&str, usize); 5] = [
     ("Device", 1),
     ("Preferences", 3),
+    ("Credentials", 1),
     ("Confirm", 1),
     ("Download", 1),
 ];
 
 /// The section the operator is in, and the page within it, both counted from the first.
 fn position(model: &Model) -> (usize, usize) {
-    match (&model.run, &model.confirming, &model.choosing) {
-        (Some(_), _, _) => (3, 0),
-        (None, Some(_), _) => (2, 0),
-        (None, None, Some(choosing)) => (1, choosing.menus.page()),
-        (None, None, None) => (0, 0),
+    match (
+        &model.run,
+        &model.confirming,
+        &model.credentialing,
+        &model.choosing,
+    ) {
+        (Some(_), _, _, _) => (4, 0),
+        (None, Some(_), _, _) => (3, 0),
+        (None, None, Some(_), _) => (2, 0),
+        (None, None, None, Some(choosing)) => (1, choosing.menus.page()),
+        (None, None, None, None) => (0, 0),
     }
 }
 
@@ -226,10 +288,13 @@ pub fn view(model: &Model, frame: &mut Frame) {
     frame.render_widget(Paragraph::new(progress(model)), progress_area);
 
     match &model.run {
-        None => match (&model.confirming, &model.choosing) {
-            (Some(confirming), _) => view_confirming(confirming, frame, body_area),
-            (None, Some(choosing)) => preferences::view(&choosing.menus, frame, body_area),
-            (None, None) => select::view(&model.select, frame, body_area),
+        None => match (&model.confirming, &model.credentialing, &model.choosing) {
+            (Some(confirming), _, _) => view_confirming(confirming, frame, body_area),
+            (None, Some(credentialing), _) => {
+                network::view(&credentialing.network, frame, body_area)
+            }
+            (None, None, Some(choosing)) => preferences::view(&choosing.menus, frame, body_area),
+            (None, None, None) => select::view(&model.select, frame, body_area),
         },
         Some(Run::Active { job, preferences }) => {
             view_active(job.current(), preferences, frame, body_area)
@@ -299,6 +364,7 @@ fn view_confirming(confirming: &Confirming, frame: &mut Frame, area: Rect) {
             .map(|caveat| format!("Caveat: {caveat}")),
     );
     lines.push(format!("Preferences: {}", confirming.preferences));
+    lines.push(format!("Network: {}", confirming.wifi));
     lines.push(
         "Press Enter to download and verify the image. Esc or Left goes back to change your choices. Ctrl-C quits.".to_owned(),
     );
@@ -378,6 +444,35 @@ mod tests {
         let mut model = Model::new(PathBuf::from("."));
         update(&mut model, &key(KeyCode::Enter, KeyModifiers::NONE));
         model
+    }
+
+    /// Picks the first device and every first option of the preferences, then continues past the last screen.
+    fn complete_preferences(model: &mut Model) {
+        update(model, &key(KeyCode::Char(' '), KeyModifiers::NONE));
+        update(model, &key(KeyCode::Enter, KeyModifiers::NONE));
+        update(model, &key(KeyCode::Enter, KeyModifiers::NONE));
+        update(model, &key(KeyCode::Char(' '), KeyModifiers::NONE));
+        update(model, &key(KeyCode::Enter, KeyModifiers::NONE));
+        update(model, &key(KeyCode::Char(' '), KeyModifiers::NONE));
+        update(model, &key(KeyCode::Enter, KeyModifiers::NONE));
+        update(model, &key(KeyCode::Char(' '), KeyModifiers::NONE));
+        update(model, &key(KeyCode::Enter, KeyModifiers::NONE));
+    }
+
+    fn type_text(model: &mut Model, text: &str) {
+        for c in text.chars() {
+            update(model, &key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+    }
+
+    /// Fills in a valid Wi-Fi network on the Network page and continues from it.
+    fn complete_network(model: &mut Model) {
+        type_text(model, "Home");
+        update(model, &key(KeyCode::Down, KeyModifiers::NONE));
+        type_text(model, "correct horse");
+        update(model, &key(KeyCode::Down, KeyModifiers::NONE));
+        type_text(model, "GB");
+        update(model, &key(KeyCode::Enter, KeyModifiers::NONE));
     }
 
     #[test]
@@ -508,39 +603,46 @@ mod tests {
     }
 
     #[test]
-    fn complete_preferences_show_a_confirmation_that_starts_nothing() {
+    fn complete_preferences_lead_to_the_network_page_and_a_valid_network_to_the_confirmation() {
         let mut model = started();
-        update(&mut model, &key(KeyCode::Char(' '), KeyModifiers::NONE));
-        update(&mut model, &key(KeyCode::Enter, KeyModifiers::NONE));
-        update(&mut model, &key(KeyCode::Enter, KeyModifiers::NONE));
-        update(&mut model, &key(KeyCode::Char(' '), KeyModifiers::NONE));
-        update(&mut model, &key(KeyCode::Enter, KeyModifiers::NONE));
-        update(&mut model, &key(KeyCode::Char(' '), KeyModifiers::NONE));
-        update(&mut model, &key(KeyCode::Enter, KeyModifiers::NONE));
-        update(&mut model, &key(KeyCode::Char(' '), KeyModifiers::NONE));
-        update(&mut model, &key(KeyCode::Enter, KeyModifiers::NONE));
+        complete_preferences(&mut model);
 
+        assert!(model.credentialing.is_some(), "the network page is shown");
+        assert!(model.confirming.is_none(), "the network is not yet entered");
+        assert!(model.run.is_none());
+
+        complete_network(&mut model);
+
+        assert!(model.credentialing.is_none());
         assert!(model.confirming.is_some(), "the confirmation is shown");
         assert!(model.choosing.is_none());
         assert!(model.run.is_none(), "confirming starts nothing");
     }
 
     #[test]
-    fn escape_on_the_confirmation_returns_to_the_preferences_and_keeps_them() {
+    fn an_invalid_network_page_does_not_continue() {
         let mut model = started();
-        update(&mut model, &key(KeyCode::Char(' '), KeyModifiers::NONE));
+        complete_preferences(&mut model);
+
         update(&mut model, &key(KeyCode::Enter, KeyModifiers::NONE));
-        update(&mut model, &key(KeyCode::Enter, KeyModifiers::NONE));
-        update(&mut model, &key(KeyCode::Char(' '), KeyModifiers::NONE));
-        update(&mut model, &key(KeyCode::Enter, KeyModifiers::NONE));
-        update(&mut model, &key(KeyCode::Char(' '), KeyModifiers::NONE));
-        update(&mut model, &key(KeyCode::Enter, KeyModifiers::NONE));
-        update(&mut model, &key(KeyCode::Char(' '), KeyModifiers::NONE));
-        update(&mut model, &key(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(
+            model.credentialing.is_some(),
+            "the network is not yet valid"
+        );
+        assert!(model.confirming.is_none());
+    }
+
+    #[test]
+    fn escape_on_the_network_page_returns_to_the_preferences_and_keeps_them() {
+        let mut model = started();
+        complete_preferences(&mut model);
+        complete_network(&mut model);
+        update(&mut model, &key(KeyCode::Esc, KeyModifiers::NONE));
 
         assert!(!update(&mut model, &key(KeyCode::Esc, KeyModifiers::NONE)));
 
-        assert!(model.confirming.is_none());
+        assert!(model.credentialing.is_none());
         let choosing = model.choosing.as_ref().expect("back on the preferences");
         assert_eq!(
             choosing.menus.confirmed().map(|p| p.harnesses),
@@ -550,17 +652,30 @@ mod tests {
     }
 
     #[test]
+    fn escape_on_the_confirmation_returns_to_the_network_page_and_keeps_it() {
+        let mut model = started();
+        complete_preferences(&mut model);
+        complete_network(&mut model);
+
+        assert!(!update(&mut model, &key(KeyCode::Esc, KeyModifiers::NONE)));
+
+        assert!(model.confirming.is_none());
+        let credentialing = model
+            .credentialing
+            .as_ref()
+            .expect("back on the network page");
+        assert_eq!(
+            credentialing.network.wifi().map(|wifi| wifi.ssid),
+            Some("Home".to_owned())
+        );
+        assert!(model.run.is_none());
+    }
+
+    #[test]
     fn the_confirmation_shows_the_choices_before_the_download() {
         let mut model = started();
-        update(&mut model, &key(KeyCode::Char(' '), KeyModifiers::NONE));
-        update(&mut model, &key(KeyCode::Enter, KeyModifiers::NONE));
-        update(&mut model, &key(KeyCode::Enter, KeyModifiers::NONE));
-        update(&mut model, &key(KeyCode::Char(' '), KeyModifiers::NONE));
-        update(&mut model, &key(KeyCode::Enter, KeyModifiers::NONE));
-        update(&mut model, &key(KeyCode::Char(' '), KeyModifiers::NONE));
-        update(&mut model, &key(KeyCode::Enter, KeyModifiers::NONE));
-        update(&mut model, &key(KeyCode::Char(' '), KeyModifiers::NONE));
-        update(&mut model, &key(KeyCode::Enter, KeyModifiers::NONE));
+        complete_preferences(&mut model);
+        complete_network(&mut model);
 
         let mut terminal = Terminal::new(TestBackend::new(120, 20)).unwrap();
         terminal.draw(|frame| view(&model, frame)).unwrap();
@@ -585,10 +700,17 @@ mod tests {
             ),
             "{rendered}"
         );
+        assert!(
+            rendered.contains(
+                "Network: Wi-Fi SSID \"Home\", passphrase ********, country GB (United Kingdom"
+            ),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("correct horse"), "{rendered}");
     }
 
     #[test]
-    fn left_goes_back_a_stage_from_the_preferences_and_the_confirmation() {
+    fn left_goes_back_a_stage_through_each_page() {
         let mut model = started();
         update(&mut model, &key(KeyCode::Char(' '), KeyModifiers::NONE));
         update(&mut model, &key(KeyCode::Enter, KeyModifiers::NONE));
@@ -608,11 +730,20 @@ mod tests {
         update(&mut model, &key(KeyCode::Enter, KeyModifiers::NONE));
         update(&mut model, &key(KeyCode::Char(' '), KeyModifiers::NONE));
         update(&mut model, &key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(model.credentialing.is_some());
+
+        update(&mut model, &key(KeyCode::Left, KeyModifiers::NONE));
+        assert!(model.credentialing.is_none());
+        assert!(model.choosing.is_some(), "back on the preferences");
+
+        update(&mut model, &key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(model.credentialing.is_some());
+        complete_network(&mut model);
         assert!(model.confirming.is_some());
 
         update(&mut model, &key(KeyCode::Left, KeyModifiers::NONE));
         assert!(model.confirming.is_none());
-        assert!(model.choosing.is_some(), "back on the preferences");
+        assert!(model.credentialing.is_some(), "back on the network page");
         assert!(model.run.is_none());
     }
 
@@ -630,7 +761,23 @@ mod tests {
         let progress: String = (0..120).map(|x| buffer[(x, 0)].symbol()).collect();
 
         assert!(
-            progress.contains("✓ Device › Preferences 2/3 › Confirm › Download"),
+            progress.contains("✓ Device › Preferences 2/3 › Credentials › Confirm › Download"),
+            "{progress}"
+        );
+    }
+
+    #[test]
+    fn the_network_page_sits_between_the_preferences_and_the_confirmation_in_the_progress_line() {
+        let mut model = started();
+        complete_preferences(&mut model);
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 20)).unwrap();
+        terminal.draw(|frame| view(&model, frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let progress: String = (0..120).map(|x| buffer[(x, 0)].symbol()).collect();
+
+        assert!(
+            progress.contains("✓ Device › ✓ Preferences › Credentials › Confirm › Download"),
             "{progress}"
         );
     }
