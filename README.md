@@ -13,14 +13,16 @@ When complete, one interface walks you through:
 
 - [x] choosing the Raspberry Pi device you own,
 - [x] choosing PREFERENCES: orchestrator (herdr), harness (pi, opencode, or Claude Code), and sandbox (nono),
-- [ ] entering CREDENTIALS: your Wi-Fi network name and passkey, and a Tailscale auth key,
+- [x] entering network CREDENTIALS: your Wi-Fi network name and passkey
+- [x] entering device CREDENTIALS: hostname and password for the device
+- [ ] entering connectivity CREDENTIALS: a Tailscale auth key
 - [ ] choosing the drive to flash,
 - [x] confirming the choices,
 - [x] downloading the DietPi image for the device and checking it against its published checksum and signature,
 - [x] decompressing it,
-- [ ] writing your choices into the image's boot partition,
+- [x] writing your choices into the image's boot partition,
 - [ ] flashing the image, with an elevated-privilege prompt for that step only,
-- [ ] deleting every file it created along the way.
+- [x] deleting every file it created along the way
 
 ## Operating system
 

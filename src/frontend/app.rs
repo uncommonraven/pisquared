@@ -19,6 +19,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Gauge, Paragraph, Wrap};
 
 use crate::backend::catalogue::Device;
+use crate::backend::configure::Settings;
 use crate::backend::fetch::Verification;
 use crate::backend::network::Connection;
 use crate::backend::preferences::Preferences;
@@ -60,8 +61,8 @@ struct Hostnaming {
     hostname: hostname::Model,
 }
 
-/// A chosen device whose complete preferences, valid network, and valid hostname are shown for the operator to confirm
-/// before anything is downloaded.
+/// A chosen device whose complete preferences, valid network, and valid hostname and password are shown for the operator
+/// to confirm before anything is downloaded.
 struct Confirming {
     device: &'static Device,
     menus: preferences::Model,
@@ -70,6 +71,7 @@ struct Confirming {
     hostname: hostname::Model,
     connection: Connection,
     name: String,
+    password: String,
 }
 
 enum Run {
@@ -208,15 +210,20 @@ fn credential(model: &mut Model, mut credentialing: Credentialing, key: &KeyEven
     false
 }
 
-/// Applies a key on the Hostname page: Enter continues once the hostname is valid, Left or Esc goes back to the Network
-/// page with its values kept, and Ctrl-C quits. Any other key edits the page.
+/// Applies a key on the Hostname page: Enter continues once the hostname and password are valid, Left or Esc goes back to
+/// the Network page with its values kept, and Ctrl-C quits. Any other key edits the page.
 fn name_host(model: &mut Model, mut hostnaming: Hostnaming, key: &KeyEvent) -> bool {
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
         return true;
     }
     match key.code {
-        KeyCode::Enter => match (hostnaming.network.connection(), hostnaming.hostname.name()) {
-            (Some(connection), Some(name)) => {
+        KeyCode::Enter => match (
+            hostnaming.network.connection(),
+            hostnaming.hostname.name(),
+            hostnaming.hostname.password(),
+        ) {
+            (Some(connection), Some(name), Some(password)) => {
+                hostnaming.hostname.leave();
                 model.confirming = Some(Confirming {
                     device: hostnaming.device,
                     menus: hostnaming.menus,
@@ -225,11 +232,13 @@ fn name_host(model: &mut Model, mut hostnaming: Hostnaming, key: &KeyEvent) -> b
                     hostname: hostnaming.hostname,
                     connection,
                     name,
+                    password,
                 });
             }
             _ => model.hostnaming = Some(hostnaming),
         },
         KeyCode::Esc | KeyCode::Left => {
+            hostnaming.hostname.leave();
             model.credentialing = Some(Credentialing {
                 device: hostnaming.device,
                 menus: hostnaming.menus,
@@ -254,8 +263,13 @@ fn confirm(model: &mut Model, confirming: Confirming, key: &KeyEvent) -> bool {
     }
     match key.code {
         KeyCode::Enter => {
+            let settings = Settings {
+                connection: confirming.connection,
+                hostname: confirming.name,
+                password: confirming.password,
+            };
             model.run = Some(Run::Active {
-                job: Job::start(confirming.device.id, model.output_dir.clone()),
+                job: Job::start(confirming.device.id, settings, model.output_dir.clone()),
                 preferences: confirming.preferences,
             });
         }
@@ -375,9 +389,9 @@ pub fn view(model: &Model, frame: &mut Frame) {
 fn outcome(result: &Result<Obtained, RunError>) -> String {
     match result {
         Ok(obtained) => format!(
-            "Obtained {}. {} The decompressed file is not verified, since the publisher publishes no value for it.\nPress Esc to quit.",
+            "Obtained {}. {} The decompressed file is not verified, since the publisher publishes no value for it. Its choices are written into its boot partition, so it no longer matches the publisher's bytes. The Wi-Fi passphrase, if Wi-Fi was chosen, and the password are stored there in plain text.\nPress Esc to quit.",
             obtained.flashable.display(),
-            checksum_outcome(&obtained.verification)
+            checksum_outcome(&obtained.verification),
         ),
         Err(err) => format!("{err}\nPress Esc to quit."),
     }
@@ -435,6 +449,7 @@ fn view_confirming(confirming: &Confirming, frame: &mut Frame, area: Rect) {
     lines.push(format!("Preferences: {}", confirming.preferences));
     lines.push(format!("Network: {}", confirming.connection));
     lines.push(format!("Hostname: {}", confirming.name));
+    lines.push("Password: ********".to_owned());
     lines.push(
         "Press Enter to download and verify the image. Esc or Left goes back to change your choices. Ctrl-C quits.".to_owned(),
     );
@@ -454,7 +469,9 @@ fn view_ended(outcome: &str, log: &str, frame: &mut Frame, area: Rect) {
         outcome_area,
     );
     frame.render_widget(
-        Paragraph::new(log).block(Block::bordered().title("Log")),
+        Paragraph::new(log)
+            .wrap(Wrap { trim: false })
+            .block(Block::bordered().title("Log")),
         log_area,
     );
 }
@@ -477,6 +494,7 @@ fn describe(activity: Activity) -> String {
         } => format!("Downloading: {}", mebibytes(written)),
         Activity::Verifying => "Verifying the checksum and the signature".to_owned(),
         Activity::Decompressing => "Decompressing the image".to_owned(),
+        Activity::Configuring => "Configuring the image with your choices".to_owned(),
     }
 }
 
@@ -489,7 +507,7 @@ fn ratio(activity: Activity) -> f64 {
             total: Some(total),
         } if total > 0 => (written as f64 / total as f64).min(1.0),
         Activity::Downloading { .. } => 0.0,
-        Activity::Verifying | Activity::Decompressing => 1.0,
+        Activity::Verifying | Activity::Decompressing | Activity::Configuring => 1.0,
     }
 }
 
@@ -546,8 +564,10 @@ mod tests {
         update(model, &key(KeyCode::Enter, KeyModifiers::NONE));
     }
 
-    /// Accepts the default hostname on the Hostname page and continues from it.
+    /// Accepts the default hostname and enters a valid password on the Hostname page, and continues from it.
     fn complete_hostname(model: &mut Model) {
+        update(model, &key(KeyCode::Down, KeyModifiers::NONE));
+        type_text(model, "pi-squared-2026");
         update(model, &key(KeyCode::Enter, KeyModifiers::NONE));
     }
 
@@ -650,13 +670,15 @@ mod tests {
             reason: "the server answered 404 Not Found".to_owned(),
         });
         assert!(unverified.contains("404 Not Found"), "{unverified}");
-        assert!(!unverified.contains("matches"), "{unverified}");
+        assert!(!unverified.contains("checksum matches"), "{unverified}");
 
         let verified = obtained(Verification::Verified {
             source: "https://example.com/image.img.xz.sha256".to_owned(),
             digest: "00".to_owned(),
         });
-        assert!(verified.contains("matches"), "{verified}");
+        assert!(verified.contains("checksum matches"), "{verified}");
+        assert!(verified.contains("no longer matches"), "{verified}");
+        assert!(verified.contains("plain text"), "{verified}");
     }
 
     #[test]
@@ -832,7 +854,23 @@ mod tests {
             "{rendered}"
         );
         assert!(rendered.contains("Hostname: pisquared"), "{rendered}");
+        assert!(rendered.contains("Password: ********"), "{rendered}");
         assert!(!rendered.contains("correct horse"), "{rendered}");
+        assert!(!rendered.contains("pi-squared-2026"), "{rendered}");
+    }
+
+    #[test]
+    fn an_invalid_password_does_not_continue_to_the_confirmation() {
+        let mut model = started();
+        complete_preferences(&mut model);
+        complete_network(&mut model);
+        update(&mut model, &key(KeyCode::Down, KeyModifiers::NONE));
+        type_text(&mut model, "short");
+
+        update(&mut model, &key(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(model.hostnaming.is_some(), "the password is not yet valid");
+        assert!(model.confirming.is_none());
     }
 
     #[test]
@@ -939,5 +977,28 @@ mod tests {
             &mut model,
             &key(KeyCode::Char('c'), KeyModifiers::CONTROL)
         ));
+    }
+
+    #[test]
+    fn a_long_log_entry_wraps_instead_of_running_off_a_narrow_terminal() {
+        let mut model = started();
+        model.run = Some(Run::Ended {
+            outcome: "Obtained image.img.".to_owned(),
+            log: "[configure] Wi-Fi choices written to the boot partition of /home/operator/output/DietPi_RPi5-ARMv8-Trixie.img; the passphrase is stored there in plain text\n".to_owned(),
+        });
+
+        let mut terminal = Terminal::new(TestBackend::new(40, 30)).unwrap();
+        terminal.draw(|frame| view(&model, frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let rendered: Vec<String> = (0..30)
+            .map(|y| (1..39).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+            .collect();
+        let rendered = rendered.join(" ");
+        let rendered = rendered.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        assert!(
+            rendered.contains("the passphrase is stored there in plain text"),
+            "{rendered}"
+        );
     }
 }

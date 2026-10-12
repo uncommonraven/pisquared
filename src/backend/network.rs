@@ -11,6 +11,11 @@ const PASSPHRASE_MIN_LEN: usize = 8;
 const PASSPHRASE_MAX_LEN: usize = 63;
 const KEY_HEX_LEN: usize = 64;
 const HOSTNAME_MAX_LEN: usize = 63;
+const PASSWORD_MIN_LEN: usize = 8;
+const PASSWORD_MAX_LEN: usize = 63;
+/// The characters a password may use. They are written unquoted into `dietpi.txt`, so the set leaves out spaces and
+/// anything a shell would read as syntax.
+const PASSWORD_CHARS: &str = "-_.,!@%+:^";
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum SsidError {
@@ -36,6 +41,16 @@ pub enum PassphraseError {
 pub enum CountryCodeError {
     #[error("the country code is not an ISO 3166-1 alpha-2 code")]
     Unknown,
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum PasswordError {
+    #[error("the password is shorter than 8 characters")]
+    TooShort,
+    #[error("the password is longer than 63 characters")]
+    TooLong,
+    #[error("the password may contain only letters, digits, and - _ . , ! @ % + : ^")]
+    NotAllowed,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -78,6 +93,24 @@ pub fn validate_passphrase(passphrase: &str) -> Result<(), PassphraseError> {
         Ok(())
     } else {
         Err(PassphraseError::NotPrintable)
+    }
+}
+
+/// The DietPi login password for the console: 8 to 63 letters, digits, or characters from `PASSWORD_CHARS`.
+pub fn validate_password(password: &str) -> Result<(), PasswordError> {
+    if password.len() < PASSWORD_MIN_LEN {
+        return Err(PasswordError::TooShort);
+    }
+    if password.len() > PASSWORD_MAX_LEN {
+        return Err(PasswordError::TooLong);
+    }
+    if password
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || PASSWORD_CHARS.as_bytes().contains(&byte))
+    {
+        Ok(())
+    } else {
+        Err(PasswordError::NotAllowed)
     }
 }
 
@@ -292,6 +325,38 @@ mod tests {
         assert_eq!(validate_country_code("XX"), Err(CountryCodeError::Unknown));
         assert_eq!(validate_country_code("GBR"), Err(CountryCodeError::Unknown));
         assert_eq!(validate_country_code(""), Err(CountryCodeError::Unknown));
+    }
+
+    #[test]
+    fn password_length_boundaries() {
+        assert_eq!(validate_password("1234567"), Err(PasswordError::TooShort));
+        assert_eq!(validate_password("12345678"), Ok(()));
+        assert_eq!(validate_password(&"a".repeat(63)), Ok(()));
+        assert_eq!(
+            validate_password(&"a".repeat(64)),
+            Err(PasswordError::TooLong)
+        );
+    }
+
+    #[test]
+    fn password_allows_letters_digits_and_a_few_symbols_only() {
+        assert_eq!(validate_password("Pi-2_Squared.ok!"), Ok(()));
+        assert_eq!(
+            validate_password("has space"),
+            Err(PasswordError::NotAllowed)
+        );
+        assert_eq!(
+            validate_password("hash#tag12"),
+            Err(PasswordError::NotAllowed)
+        );
+        assert_eq!(
+            validate_password("dollar$12"),
+            Err(PasswordError::NotAllowed)
+        );
+        assert_eq!(
+            validate_password("quote'12x"),
+            Err(PasswordError::NotAllowed)
+        );
     }
 
     #[test]

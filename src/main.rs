@@ -13,9 +13,9 @@ use frontend::app;
 const REDRAW_EVERY: Duration = Duration::from_millis(100);
 
 fn main() -> io::Result<()> {
-    let output_dir = std::env::current_dir()?;
+    let output = tempfile::tempdir()?;
     let mut terminal = ratatui::init();
-    let result = interact(&mut terminal, app::Model::new(output_dir));
+    let result = interact(&mut terminal, app::Model::new(output.path().to_path_buf()));
     ratatui::restore();
     result
 }

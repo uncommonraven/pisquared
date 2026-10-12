@@ -12,6 +12,7 @@ pub enum Step {
     Checksum,
     Signature,
     Decompress,
+    Configure,
 }
 
 impl Step {
@@ -22,6 +23,7 @@ impl Step {
             Step::Checksum => "checksum",
             Step::Signature => "signature",
             Step::Decompress => "decompress",
+            Step::Configure => "configure",
         }
     }
 }

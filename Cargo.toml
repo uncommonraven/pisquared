@@ -10,7 +10,7 @@ anyhow = "1.0.104"
 async-compression = { version = "0.4.50", features = ["xz", "tokio"] }
 clap = { version = "4.6.7", features = ["derive"] }
 crossterm = "0.29.0"
-fatfs = { version = "0.3.6", default-features = false, features = ["std"] }
+fatfs = { version = "0.3.6", default-features = false, features = ["std", "alloc"] }
 fscommon = "0.1.1"
 liblzma = { version = "0.4.8", features = ["static"] }
 pgp = "=0.21.0"
