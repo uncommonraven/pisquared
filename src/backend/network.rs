@@ -129,6 +129,22 @@ impl fmt::Display for Wifi {
     }
 }
 
+/// How the image connects the Pi to the network: over Wi-Fi with its valid fields, or over Ethernet with nothing to enter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Connection {
+    Wifi(Wifi),
+    Ethernet,
+}
+
+impl fmt::Display for Connection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Wifi(wifi) => write!(f, "{wifi}"),
+            Self::Ethernet => write!(f, "Ethernet, addressed automatically by DHCP."),
+        }
+    }
+}
+
 /// A hostname is one DNS label: 1 to 63 ASCII letters, digits, or hyphens, not starting or ending with a hyphen.
 pub fn validate_hostname(hostname: &str) -> Result<(), HostnameError> {
     if hostname.is_empty() {

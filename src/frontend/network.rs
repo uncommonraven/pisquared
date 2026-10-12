@@ -1,9 +1,12 @@
-//! The Network page of the Credentials section: the Wi-Fi network name, its passphrase, and its country code.
+//! The Network page of the Credentials section: the connection, Wi-Fi or Ethernet, and for Wi-Fi the network name, its
+//! passphrase, and its country code.
 //!
-//! Up and down move between the fields, and typing edits the field under the cursor. Every field shows its error next
-//! to it, and the page continues only once all of them are valid. The passphrase is masked until Tab shows it. The
-//! country code is searched by typing: the countries whose code or name matches are listed beneath the field, and the
-//! code is kept in capitals. The rules are the backend's; this view holds only what is typed and where the cursor is.
+//! Up and down move between the fields. Space or Right switches the connection while its field is under the cursor,
+//! and typing edits the field under the cursor. Ethernet hides the Wi-Fi fields, since it needs nothing else. Every
+//! visible field shows its error next to it, and the page continues only once all of them are valid. The passphrase is
+//! masked until Tab shows it. The country code is searched by typing: the countries whose code or name matches are
+//! listed beneath the field, and the code is kept in capitals. The rules are the backend's; this view holds only what
+//! is typed and where the cursor is.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
@@ -12,7 +15,7 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph, Wrap};
 
-use crate::backend::network::{self, Wifi};
+use crate::backend::network::{self, Connection, Wifi};
 
 /// How many matching countries are listed beneath the country code.
 const MATCHES_SHOWN: usize = 5;
@@ -20,33 +23,49 @@ const MATCHES_SHOWN: usize = 5;
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 enum Field {
     #[default]
+    Connection,
     Ssid,
     Passphrase,
     Country,
 }
 
 impl Field {
-    const ALL: [Self; 3] = [Self::Ssid, Self::Passphrase, Self::Country];
+    const ALL: [Self; 4] = [
+        Self::Connection,
+        Self::Ssid,
+        Self::Passphrase,
+        Self::Country,
+    ];
 
     fn label(self) -> &'static str {
         match self {
+            Self::Connection => "Connection",
             Self::Ssid => "Wi-Fi network name (SSID)",
             Self::Passphrase => "Wi-Fi passphrase",
             Self::Country => "Wi-Fi country code",
         }
     }
+}
 
-    fn next(self) -> Self {
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum Medium {
+    #[default]
+    Wifi,
+    Ethernet,
+}
+
+impl Medium {
+    fn toggled(self) -> Self {
         match self {
-            Self::Ssid => Self::Passphrase,
-            Self::Passphrase | Self::Country => Self::Country,
+            Self::Wifi => Self::Ethernet,
+            Self::Ethernet => Self::Wifi,
         }
     }
 
-    fn previous(self) -> Self {
+    fn name(self) -> &'static str {
         match self {
-            Self::Ssid | Self::Passphrase => Self::Ssid,
-            Self::Country => Self::Passphrase,
+            Self::Wifi => "Wi-Fi",
+            Self::Ethernet => "Ethernet",
         }
     }
 }
@@ -54,6 +73,7 @@ impl Field {
 #[derive(Default)]
 pub struct Model {
     field: Field,
+    medium: Medium,
     ssid: String,
     passphrase: String,
     country_code: String,
@@ -61,9 +81,21 @@ pub struct Model {
 }
 
 impl Model {
-    /// The Wi-Fi network, once every field is valid.
-    pub fn wifi(&self) -> Option<Wifi> {
-        Field::ALL
+    /// The connection, once its fields are valid. Ethernet needs nothing, and Wi-Fi needs every Wi-Fi field.
+    pub fn connection(&self) -> Option<Connection> {
+        match self.medium {
+            Medium::Ethernet => Some(Connection::Ethernet),
+            Medium::Wifi => self.wifi().map(Connection::Wifi),
+        }
+    }
+
+    /// Hides the passphrase again, as it is whenever the page is left.
+    pub fn leave(&mut self) {
+        self.reveal = false;
+    }
+
+    fn wifi(&self) -> Option<Wifi> {
+        [Field::Ssid, Field::Passphrase, Field::Country]
             .iter()
             .all(|field| self.error(*field).is_none())
             .then(|| Wifi {
@@ -73,13 +105,25 @@ impl Model {
             })
     }
 
-    /// Hides the passphrase again, as it is whenever the page is left.
-    pub fn leave(&mut self) {
-        self.reveal = false;
+    fn visible(&self) -> &'static [Field] {
+        match self.medium {
+            Medium::Wifi => &Field::ALL,
+            Medium::Ethernet => &[Field::Connection],
+        }
+    }
+
+    fn moved(&self, step: isize) -> Field {
+        let visible = self.visible();
+        let index = visible
+            .iter()
+            .position(|field| *field == self.field)
+            .unwrap_or(0);
+        visible[index.saturating_add_signed(step).min(visible.len() - 1)]
     }
 
     fn error(&self, field: Field) -> Option<String> {
         match field {
+            Field::Connection => None,
             Field::Ssid => network::validate_ssid(&self.ssid)
                 .err()
                 .map(|err| err.to_string()),
@@ -92,16 +136,18 @@ impl Model {
         }
     }
 
-    fn text(&mut self) -> &mut String {
+    fn text(&mut self) -> Option<&mut String> {
         match self.field {
-            Field::Ssid => &mut self.ssid,
-            Field::Passphrase => &mut self.passphrase,
-            Field::Country => &mut self.country_code,
+            Field::Connection => None,
+            Field::Ssid => Some(&mut self.ssid),
+            Field::Passphrase => Some(&mut self.passphrase),
+            Field::Country => Some(&mut self.country_code),
         }
     }
 
     fn shown(&self, field: Field) -> String {
         match field {
+            Field::Connection => self.medium.name().to_owned(),
             Field::Ssid => self.ssid.clone(),
             Field::Passphrase if self.reveal => self.passphrase.clone(),
             Field::Passphrase => "*".repeat(self.passphrase.chars().count()),
@@ -113,22 +159,29 @@ impl Model {
     }
 }
 
-/// Applies a key press: Up and down move between the fields, Tab shows or hides the passphrase, and typing edits the
-/// field under the cursor.
+/// Applies a key press: Up and down move between the fields, Space or Right switches the connection, Tab shows or hides
+/// the passphrase, and typing edits the field under the cursor.
 pub fn update(model: &mut Model, key: &KeyEvent) {
     match key.code {
-        KeyCode::Up => model.field = model.field.previous(),
-        KeyCode::Down => model.field = model.field.next(),
+        KeyCode::Up => model.field = model.moved(-1),
+        KeyCode::Down => model.field = model.moved(1),
         KeyCode::Tab => model.reveal = !model.reveal,
+        KeyCode::Right | KeyCode::Char(' ') if model.field == Field::Connection => {
+            model.medium = model.medium.toggled();
+        }
         KeyCode::Backspace => {
-            model.text().pop();
+            if let Some(text) = model.text() {
+                text.pop();
+            }
         }
         KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
             let c = match model.field {
                 Field::Country => c.to_ascii_uppercase(),
                 _ => c,
             };
-            model.text().push(c);
+            if let Some(text) = model.text() {
+                text.push(c);
+            }
         }
         _ => {}
     }
@@ -139,11 +192,13 @@ pub fn view(model: &Model, frame: &mut Frame, area: Rect) {
         Layout::vertical([Constraint::Fill(1), Constraint::Length(3)]).areas(area);
 
     frame.render_widget(
-        Paragraph::new(page_lines(model)).block(
-            Block::bordered()
-                .title("Network")
-                .border_style(Style::new().bold()),
-        ),
+        Paragraph::new(page_lines(model))
+            .wrap(Wrap { trim: false })
+            .block(
+                Block::bordered()
+                    .title("Network")
+                    .border_style(Style::new().bold()),
+            ),
         page_area,
     );
     frame.render_widget(
@@ -154,7 +209,7 @@ pub fn view(model: &Model, frame: &mut Frame, area: Rect) {
 
 fn page_lines(model: &Model) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
-    for field in Field::ALL {
+    for &field in model.visible() {
         let focused = field == model.field;
         let marker = if focused { "> " } else { "  " };
         let label_style = if focused {
@@ -174,11 +229,19 @@ fn page_lines(model: &Model) -> Vec<Line<'static>> {
         }
     }
     lines.push(Line::default());
-    lines.push(Line::styled(
-        "Warning: a wrong SSID or passphrase leaves the Pi offline. Ethernet is disabled, so there is no fallback.",
-        Style::new().yellow(),
-    ));
+    lines.push(Line::styled(warning(model), Style::new().yellow()));
     lines
+}
+
+fn warning(model: &Model) -> &'static str {
+    match model.medium {
+        Medium::Wifi => {
+            "Warning: a wrong SSID or passphrase leaves the Pi offline. Ethernet is disabled, so there is no fallback."
+        }
+        Medium::Ethernet => {
+            "Warning: with Ethernet chosen there is no Wi-Fi fallback, so the Pi stays offline unless its cable reaches a network."
+        }
+    }
 }
 
 fn matching_lines(query: &str) -> Vec<Line<'static>> {
@@ -199,13 +262,13 @@ fn matching_lines(query: &str) -> Vec<Line<'static>> {
 }
 
 fn footer(model: &Model) -> String {
-    let status = if model.wifi().is_some() {
+    let status = if model.connection().is_some() {
         "Enter continues to confirm your choices."
     } else {
         "Fill in every field to continue."
     };
     format!(
-        "{status}\nUp and down move, type to edit, Tab shows or hides the passphrase. Enter continues. Left or Esc goes back. Ctrl-C quits."
+        "{status}\nUp and down move, Space or Right switches Wi-Fi and Ethernet, type to edit, Tab shows or hides the passphrase. Enter continues. Left or Esc goes back. Ctrl-C quits."
     )
 }
 
@@ -228,8 +291,10 @@ mod tests {
         }
     }
 
+    /// A valid Wi-Fi network, entered from the first Wi-Fi field.
     fn filled() -> Model {
         let mut model = Model::default();
+        update(&mut model, &key(KeyCode::Down));
         type_text(&mut model, "Home");
         update(&mut model, &key(KeyCode::Down));
         type_text(&mut model, "correct horse");
@@ -238,20 +303,24 @@ mod tests {
         model
     }
 
-    fn screen(model: &Model) -> String {
-        let mut terminal = Terminal::new(TestBackend::new(WIDTH, HEIGHT)).unwrap();
+    fn screen_sized(model: &Model, width: u16, height: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal
             .draw(|frame| view(model, frame, frame.area()))
             .unwrap();
         let buffer = terminal.backend().buffer();
-        (0..HEIGHT)
+        (0..height)
             .map(|y| {
-                (0..WIDTH)
+                (0..width)
                     .map(|x| buffer[(x, y)].symbol())
                     .collect::<String>()
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    fn screen(model: &Model) -> String {
+        screen_sized(model, WIDTH, HEIGHT)
     }
 
     /// Wrapping breaks long text across rows, so the screen is compared by its words.
@@ -260,8 +329,30 @@ mod tests {
     }
 
     #[test]
+    fn the_connection_starts_on_wifi_and_space_switches_it() {
+        let mut model = Model::default();
+        assert_eq!(model.medium, Medium::Wifi);
+
+        update(&mut model, &key(KeyCode::Char(' ')));
+        assert_eq!(model.medium, Medium::Ethernet);
+
+        update(&mut model, &key(KeyCode::Right));
+        assert_eq!(model.medium, Medium::Wifi);
+    }
+
+    #[test]
+    fn typing_on_the_connection_field_edits_nothing() {
+        let mut model = Model::default();
+        type_text(&mut model, "Home");
+
+        assert_eq!(model.ssid, "");
+        assert_eq!(model.medium, Medium::Wifi);
+    }
+
+    #[test]
     fn typing_edits_the_field_under_the_cursor() {
         let mut model = Model::default();
+        update(&mut model, &key(KeyCode::Down));
         type_text(&mut model, "Home");
         update(&mut model, &key(KeyCode::Down));
         type_text(&mut model, "pass");
@@ -277,7 +368,7 @@ mod tests {
     fn the_cursor_stops_at_the_first_and_last_fields() {
         let mut model = Model::default();
         update(&mut model, &key(KeyCode::Up));
-        assert_eq!(model.field, Field::Ssid);
+        assert_eq!(model.field, Field::Connection);
 
         for _ in 0..5 {
             update(&mut model, &key(KeyCode::Down));
@@ -288,8 +379,9 @@ mod tests {
     #[test]
     fn country_codes_are_kept_in_capitals() {
         let mut model = Model::default();
-        update(&mut model, &key(KeyCode::Down));
-        update(&mut model, &key(KeyCode::Down));
+        for _ in 0..3 {
+            update(&mut model, &key(KeyCode::Down));
+        }
         type_text(&mut model, "gb");
 
         assert_eq!(model.country_code, "GB");
@@ -298,6 +390,7 @@ mod tests {
     #[test]
     fn ctrl_characters_are_not_typed_into_a_field() {
         let mut model = Model::default();
+        update(&mut model, &key(KeyCode::Down));
         update(
             &mut model,
             &KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
@@ -309,25 +402,25 @@ mod tests {
     #[test]
     fn the_network_is_given_only_once_every_field_is_valid() {
         let mut model = Model::default();
-        assert_eq!(model.wifi(), None);
+        assert_eq!(model.connection(), None);
 
         model.passphrase = "1234567".to_owned();
         model.ssid = "Home".to_owned();
         model.country_code = "GB".to_owned();
         assert_eq!(
-            model.wifi(),
+            model.connection(),
             None,
             "a seven-character passphrase is too short"
         );
 
         model.passphrase = "12345678".to_owned();
         assert_eq!(
-            model.wifi(),
-            Some(Wifi {
+            model.connection(),
+            Some(Connection::Wifi(Wifi {
                 ssid: "Home".to_owned(),
                 passphrase: "12345678".to_owned(),
                 country_code: "GB".to_owned(),
-            })
+            }))
         );
     }
 
@@ -336,7 +429,52 @@ mod tests {
         let mut model = filled();
         model.country_code.clear();
 
-        assert_eq!(model.wifi(), None);
+        assert_eq!(model.connection(), None);
+    }
+
+    #[test]
+    fn ethernet_needs_no_wifi_fields_and_hides_them() {
+        let mut model = Model::default();
+        update(&mut model, &key(KeyCode::Char(' ')));
+
+        assert_eq!(model.connection(), Some(Connection::Ethernet));
+        let rendered = words(&screen(&model));
+        assert!(rendered.contains("Connection: Ethernet"), "{rendered}");
+        assert!(!rendered.contains("Wi-Fi network name"), "{rendered}");
+        assert!(!rendered.contains("Wi-Fi passphrase"), "{rendered}");
+        assert!(
+            !rendered.contains("the network name is empty"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn the_cursor_stays_on_the_connection_while_ethernet_is_chosen() {
+        let mut model = Model::default();
+        update(&mut model, &key(KeyCode::Char(' ')));
+        update(&mut model, &key(KeyCode::Down));
+
+        assert_eq!(model.field, Field::Connection);
+    }
+
+    #[test]
+    fn switching_back_to_wifi_keeps_what_was_typed() {
+        let mut model = filled();
+        for _ in 0..3 {
+            update(&mut model, &key(KeyCode::Up));
+        }
+        update(&mut model, &key(KeyCode::Char(' ')));
+        assert_eq!(model.connection(), Some(Connection::Ethernet));
+
+        update(&mut model, &key(KeyCode::Char(' ')));
+        assert_eq!(
+            model.connection(),
+            Some(Connection::Wifi(Wifi {
+                ssid: "Home".to_owned(),
+                passphrase: "correct horse".to_owned(),
+                country_code: "GB".to_owned(),
+            }))
+        );
     }
 
     #[test]
@@ -368,10 +506,22 @@ mod tests {
     }
 
     #[test]
+    fn the_warning_wraps_instead_of_running_off_a_narrow_page() {
+        let rendered = screen_sized(&Model::default(), 60, 20).replace('│', " ");
+        let rendered = words(&rendered);
+
+        assert!(
+            rendered.contains("Ethernet is disabled, so there is no fallback."),
+            "{rendered}"
+        );
+    }
+
+    #[test]
     fn a_country_code_lists_the_countries_it_matches_and_names_the_chosen_one() {
         let mut model = Model::default();
-        update(&mut model, &key(KeyCode::Down));
-        update(&mut model, &key(KeyCode::Down));
+        for _ in 0..3 {
+            update(&mut model, &key(KeyCode::Down));
+        }
         type_text(&mut model, "united k");
 
         let rendered = words(&screen(&model));

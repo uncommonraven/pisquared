@@ -1,4 +1,4 @@
-//! The interface as a whole: an opening splash, choosing a device, choosing its preferences, entering its Wi-Fi network,
+//! The interface as a whole: an opening splash, choosing a device, choosing its preferences, entering its network connection,
 //! confirming the choices, then obtaining its image while showing progress, then the outcome.
 //!
 //! The splash opens the interface with a choice of Begin or Quit. Before a run starts the device selection view has the
@@ -20,16 +20,17 @@ use ratatui::widgets::{Block, Gauge, Paragraph, Wrap};
 
 use crate::backend::catalogue::Device;
 use crate::backend::fetch::Verification;
-use crate::backend::network::Wifi;
+use crate::backend::network::Connection;
 use crate::backend::preferences::Preferences;
 use crate::backend::run::{Activity, Job, Obtained, RunError};
-use crate::frontend::{network, preferences, select, splash};
+use crate::frontend::{hostname, network, preferences, select, splash};
 
 pub struct Model {
     splash: Option<splash::Model>,
     select: select::Model,
     choosing: Option<Choosing>,
     credentialing: Option<Credentialing>,
+    hostnaming: Option<Hostnaming>,
     confirming: Option<Confirming>,
     output_dir: PathBuf,
     run: Option<Run>,
@@ -41,22 +42,34 @@ struct Choosing {
     menus: preferences::Model,
 }
 
-/// A chosen device whose complete preferences are followed by its Wi-Fi network, entered before anything is downloaded.
+/// A chosen device whose complete preferences are followed by its network connection, entered before anything is downloaded.
 struct Credentialing {
     device: &'static Device,
     menus: preferences::Model,
     preferences: Preferences,
     network: network::Model,
+    hostname: hostname::Model,
 }
 
-/// A chosen device whose complete preferences and valid network are shown for the operator to confirm before anything
-/// is downloaded.
+/// A chosen device whose complete preferences and valid network are followed by its hostname.
+struct Hostnaming {
+    device: &'static Device,
+    menus: preferences::Model,
+    preferences: Preferences,
+    network: network::Model,
+    hostname: hostname::Model,
+}
+
+/// A chosen device whose complete preferences, valid network, and valid hostname are shown for the operator to confirm
+/// before anything is downloaded.
 struct Confirming {
     device: &'static Device,
     menus: preferences::Model,
     preferences: Preferences,
     network: network::Model,
-    wifi: Wifi,
+    hostname: hostname::Model,
+    connection: Connection,
+    name: String,
 }
 
 enum Run {
@@ -71,6 +84,7 @@ impl Model {
             select: select::Model::default(),
             choosing: None,
             credentialing: None,
+            hostnaming: None,
             confirming: None,
             output_dir,
             run: None,
@@ -111,6 +125,9 @@ pub fn update(model: &mut Model, event: &Event) -> bool {
             if let Some(confirming) = model.confirming.take() {
                 return confirm(model, confirming, key);
             }
+            if let Some(hostnaming) = model.hostnaming.take() {
+                return name_host(model, hostnaming, key);
+            }
             if let Some(credentialing) = model.credentialing.take() {
                 return credential(model, credentialing, key);
             }
@@ -126,6 +143,7 @@ pub fn update(model: &mut Model, event: &Event) -> bool {
                                 menus: choosing.menus,
                                 preferences,
                                 network: network::Model::default(),
+                                hostname: hostname::Model::default(),
                             });
                         }
                         None => model.choosing = Some(choosing),
@@ -155,22 +173,22 @@ pub fn update(model: &mut Model, event: &Event) -> bool {
     }
 }
 
-/// Applies a key on the Network page: Enter continues once every field is valid, Left or Esc goes back to the
+/// Applies a key on the Network page: Enter continues once the connection is valid, Left or Esc goes back to the
 /// preferences with the choices kept, and Ctrl-C quits. Any other key edits the page.
 fn credential(model: &mut Model, mut credentialing: Credentialing, key: &KeyEvent) -> bool {
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
         return true;
     }
     match key.code {
-        KeyCode::Enter => match credentialing.network.wifi() {
-            Some(wifi) => {
+        KeyCode::Enter => match credentialing.network.connection() {
+            Some(_) => {
                 credentialing.network.leave();
-                model.confirming = Some(Confirming {
+                model.hostnaming = Some(Hostnaming {
                     device: credentialing.device,
                     menus: credentialing.menus,
                     preferences: credentialing.preferences,
                     network: credentialing.network,
-                    wifi,
+                    hostname: credentialing.hostname,
                 });
             }
             None => model.credentialing = Some(credentialing),
@@ -190,7 +208,45 @@ fn credential(model: &mut Model, mut credentialing: Credentialing, key: &KeyEven
     false
 }
 
-/// Applies a key on the confirmation view: Enter starts the run, Esc or Left returns to the Network page with its values
+/// Applies a key on the Hostname page: Enter continues once the hostname is valid, Left or Esc goes back to the Network
+/// page with its values kept, and Ctrl-C quits. Any other key edits the page.
+fn name_host(model: &mut Model, mut hostnaming: Hostnaming, key: &KeyEvent) -> bool {
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        return true;
+    }
+    match key.code {
+        KeyCode::Enter => match (hostnaming.network.connection(), hostnaming.hostname.name()) {
+            (Some(connection), Some(name)) => {
+                model.confirming = Some(Confirming {
+                    device: hostnaming.device,
+                    menus: hostnaming.menus,
+                    preferences: hostnaming.preferences,
+                    network: hostnaming.network,
+                    hostname: hostnaming.hostname,
+                    connection,
+                    name,
+                });
+            }
+            _ => model.hostnaming = Some(hostnaming),
+        },
+        KeyCode::Esc | KeyCode::Left => {
+            model.credentialing = Some(Credentialing {
+                device: hostnaming.device,
+                menus: hostnaming.menus,
+                preferences: hostnaming.preferences,
+                network: hostnaming.network,
+                hostname: hostnaming.hostname,
+            });
+        }
+        _ => {
+            hostname::update(&mut hostnaming.hostname, key);
+            model.hostnaming = Some(hostnaming);
+        }
+    }
+    false
+}
+
+/// Applies a key on the confirmation view: Enter starts the run, Esc or Left returns to the Hostname page with its values
 /// kept, and Ctrl-C quits. Any other key leaves the confirmation as it is.
 fn confirm(model: &mut Model, confirming: Confirming, key: &KeyEvent) -> bool {
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -204,11 +260,12 @@ fn confirm(model: &mut Model, confirming: Confirming, key: &KeyEvent) -> bool {
             });
         }
         KeyCode::Esc | KeyCode::Left => {
-            model.credentialing = Some(Credentialing {
+            model.hostnaming = Some(Hostnaming {
                 device: confirming.device,
                 menus: confirming.menus,
                 preferences: confirming.preferences,
                 network: confirming.network,
+                hostname: confirming.hostname,
             });
         }
         _ => model.confirming = Some(confirming),
@@ -233,7 +290,7 @@ pub fn tick(model: &mut Model) {
 const SECTIONS: [(&str, usize); 5] = [
     ("Device", 1),
     ("Preferences", 3),
-    ("Credentials", 1),
+    ("Credentials", 2),
     ("Confirm", 1),
     ("Download", 1),
 ];
@@ -243,14 +300,16 @@ fn position(model: &Model) -> (usize, usize) {
     match (
         &model.run,
         &model.confirming,
+        &model.hostnaming,
         &model.credentialing,
         &model.choosing,
     ) {
-        (Some(_), _, _, _) => (4, 0),
-        (None, Some(_), _, _) => (3, 0),
-        (None, None, Some(_), _) => (2, 0),
-        (None, None, None, Some(choosing)) => (1, choosing.menus.page()),
-        (None, None, None, None) => (0, 0),
+        (Some(_), _, _, _, _) => (4, 0),
+        (None, Some(_), _, _, _) => (3, 0),
+        (None, None, Some(_), _, _) => (2, 1),
+        (None, None, None, Some(_), _) => (2, 0),
+        (None, None, None, None, Some(choosing)) => (1, choosing.menus.page()),
+        (None, None, None, None, None) => (0, 0),
     }
 }
 
@@ -288,13 +347,23 @@ pub fn view(model: &Model, frame: &mut Frame) {
     frame.render_widget(Paragraph::new(progress(model)), progress_area);
 
     match &model.run {
-        None => match (&model.confirming, &model.credentialing, &model.choosing) {
-            (Some(confirming), _, _) => view_confirming(confirming, frame, body_area),
-            (None, Some(credentialing), _) => {
+        None => match (
+            &model.confirming,
+            &model.hostnaming,
+            &model.credentialing,
+            &model.choosing,
+        ) {
+            (Some(confirming), _, _, _) => view_confirming(confirming, frame, body_area),
+            (None, Some(hostnaming), _, _) => {
+                hostname::view(&hostnaming.hostname, frame, body_area)
+            }
+            (None, None, Some(credentialing), _) => {
                 network::view(&credentialing.network, frame, body_area)
             }
-            (None, None, Some(choosing)) => preferences::view(&choosing.menus, frame, body_area),
-            (None, None, None) => select::view(&model.select, frame, body_area),
+            (None, None, None, Some(choosing)) => {
+                preferences::view(&choosing.menus, frame, body_area)
+            }
+            (None, None, None, None) => select::view(&model.select, frame, body_area),
         },
         Some(Run::Active { job, preferences }) => {
             view_active(job.current(), preferences, frame, body_area)
@@ -364,7 +433,8 @@ fn view_confirming(confirming: &Confirming, frame: &mut Frame, area: Rect) {
             .map(|caveat| format!("Caveat: {caveat}")),
     );
     lines.push(format!("Preferences: {}", confirming.preferences));
-    lines.push(format!("Network: {}", confirming.wifi));
+    lines.push(format!("Network: {}", confirming.connection));
+    lines.push(format!("Hostname: {}", confirming.name));
     lines.push(
         "Press Enter to download and verify the image. Esc or Left goes back to change your choices. Ctrl-C quits.".to_owned(),
     );
@@ -467,11 +537,17 @@ mod tests {
 
     /// Fills in a valid Wi-Fi network on the Network page and continues from it.
     fn complete_network(model: &mut Model) {
+        update(model, &key(KeyCode::Down, KeyModifiers::NONE));
         type_text(model, "Home");
         update(model, &key(KeyCode::Down, KeyModifiers::NONE));
         type_text(model, "correct horse");
         update(model, &key(KeyCode::Down, KeyModifiers::NONE));
         type_text(model, "GB");
+        update(model, &key(KeyCode::Enter, KeyModifiers::NONE));
+    }
+
+    /// Accepts the default hostname on the Hostname page and continues from it.
+    fn complete_hostname(model: &mut Model) {
         update(model, &key(KeyCode::Enter, KeyModifiers::NONE));
     }
 
@@ -603,7 +679,7 @@ mod tests {
     }
 
     #[test]
-    fn complete_preferences_lead_to_the_network_page_and_a_valid_network_to_the_confirmation() {
+    fn complete_preferences_lead_through_the_network_and_hostname_pages_to_the_confirmation() {
         let mut model = started();
         complete_preferences(&mut model);
 
@@ -614,8 +690,55 @@ mod tests {
         complete_network(&mut model);
 
         assert!(model.credentialing.is_none());
+        assert!(model.hostnaming.is_some(), "the hostname page is shown");
+        assert!(
+            model.confirming.is_none(),
+            "the hostname is not yet entered"
+        );
+
+        complete_hostname(&mut model);
+
+        assert!(model.hostnaming.is_none());
         assert!(model.confirming.is_some(), "the confirmation is shown");
         assert!(model.choosing.is_none());
+        assert!(model.run.is_none(), "confirming starts nothing");
+    }
+
+    #[test]
+    fn an_invalid_hostname_does_not_continue_to_the_confirmation() {
+        let mut model = started();
+        complete_preferences(&mut model);
+        complete_network(&mut model);
+        for _ in 0..9 {
+            update(&mut model, &key(KeyCode::Backspace, KeyModifiers::NONE));
+        }
+
+        update(&mut model, &key(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(model.hostnaming.is_some(), "the hostname is not yet valid");
+        assert!(model.confirming.is_none());
+    }
+
+    #[test]
+    fn ethernet_skips_the_wifi_fields_and_goes_on_to_the_hostname_page() {
+        let mut model = started();
+        complete_preferences(&mut model);
+        update(&mut model, &key(KeyCode::Char(' '), KeyModifiers::NONE));
+        update(&mut model, &key(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(model.credentialing.is_none());
+        assert!(model.hostnaming.is_some(), "the hostname page is shown");
+
+        complete_hostname(&mut model);
+
+        assert!(model.hostnaming.is_none());
+        assert!(matches!(
+            model
+                .confirming
+                .as_ref()
+                .map(|confirming| &confirming.connection),
+            Some(Connection::Ethernet)
+        ));
         assert!(model.run.is_none(), "confirming starts nothing");
     }
 
@@ -652,22 +775,23 @@ mod tests {
     }
 
     #[test]
-    fn escape_on_the_confirmation_returns_to_the_network_page_and_keeps_it() {
+    fn escape_on_the_confirmation_returns_to_the_hostname_page_and_keeps_the_network() {
         let mut model = started();
         complete_preferences(&mut model);
         complete_network(&mut model);
+        complete_hostname(&mut model);
 
         assert!(!update(&mut model, &key(KeyCode::Esc, KeyModifiers::NONE)));
 
         assert!(model.confirming.is_none());
-        let credentialing = model
-            .credentialing
+        let hostnaming = model
+            .hostnaming
             .as_ref()
-            .expect("back on the network page");
-        assert_eq!(
-            credentialing.network.wifi().map(|wifi| wifi.ssid),
-            Some("Home".to_owned())
-        );
+            .expect("back on the hostname page");
+        assert!(matches!(
+            hostnaming.network.connection(),
+            Some(Connection::Wifi(wifi)) if wifi.ssid == "Home"
+        ));
         assert!(model.run.is_none());
     }
 
@@ -676,6 +800,7 @@ mod tests {
         let mut model = started();
         complete_preferences(&mut model);
         complete_network(&mut model);
+        complete_hostname(&mut model);
 
         let mut terminal = Terminal::new(TestBackend::new(120, 20)).unwrap();
         terminal.draw(|frame| view(&model, frame)).unwrap();
@@ -706,6 +831,7 @@ mod tests {
             ),
             "{rendered}"
         );
+        assert!(rendered.contains("Hostname: pisquared"), "{rendered}");
         assert!(!rendered.contains("correct horse"), "{rendered}");
     }
 
@@ -739,10 +865,16 @@ mod tests {
         update(&mut model, &key(KeyCode::Enter, KeyModifiers::NONE));
         assert!(model.credentialing.is_some());
         complete_network(&mut model);
+        assert!(model.hostnaming.is_some());
+        complete_hostname(&mut model);
         assert!(model.confirming.is_some());
 
         update(&mut model, &key(KeyCode::Left, KeyModifiers::NONE));
         assert!(model.confirming.is_none());
+        assert!(model.hostnaming.is_some(), "back on the hostname page");
+
+        update(&mut model, &key(KeyCode::Left, KeyModifiers::NONE));
+        assert!(model.hostnaming.is_none());
         assert!(model.credentialing.is_some(), "back on the network page");
         assert!(model.run.is_none());
     }
@@ -777,7 +909,24 @@ mod tests {
         let progress: String = (0..120).map(|x| buffer[(x, 0)].symbol()).collect();
 
         assert!(
-            progress.contains("✓ Device › ✓ Preferences › Credentials › Confirm › Download"),
+            progress.contains("✓ Device › ✓ Preferences › Credentials 1/2 › Confirm › Download"),
+            "{progress}"
+        );
+    }
+
+    #[test]
+    fn the_hostname_page_is_the_second_credentials_page_in_the_progress_line() {
+        let mut model = started();
+        complete_preferences(&mut model);
+        complete_network(&mut model);
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 20)).unwrap();
+        terminal.draw(|frame| view(&model, frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let progress: String = (0..120).map(|x| buffer[(x, 0)].symbol()).collect();
+
+        assert!(
+            progress.contains("✓ Device › ✓ Preferences › Credentials 2/2 › Confirm › Download"),
             "{progress}"
         );
     }
