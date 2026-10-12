@@ -85,8 +85,8 @@ fn write_text<F: Editable>(
     file.save().map_err(io_error)
 }
 
-/// The `dietpi.txt` keys for the connection (NET-9, NET-10, and IMG-4), the hostname, the password, and the automated
-/// setup that runs them without a dialogue.
+/// The `dietpi.txt` keys for the connection (NET-9, NET-10, and IMG-4), the hostname, the password, the SSH server, and
+/// the automated setup that runs them without a dialogue.
 pub fn dietpi_txt(text: &str, settings: &Settings) -> Result<String, ConfigureError> {
     let text = match &settings.connection {
         Connection::Wifi(wifi) => {
@@ -113,6 +113,7 @@ pub fn dietpi_txt(text: &str, settings: &Settings) -> Result<String, ConfigureEr
         "AUTO_SETUP_GLOBAL_PASSWORD",
         plain("AUTO_SETUP_GLOBAL_PASSWORD", &settings.password)?,
     );
+    let text = set_line(&text, "AUTO_SETUP_SSH_SERVER_INDEX", "-2");
     Ok(set_line(&text, "AUTO_SETUP_AUTOMATED", "1"))
 }
 
@@ -216,7 +217,7 @@ mod tests {
         let text = "AUTO_SETUP_NET_ETHERNET_ENABLED=1\nAUTO_SETUP_NET_WIFI_ENABLED=0\n";
         assert_eq!(
             dietpi_txt(text, &wifi_settings()).unwrap(),
-            "AUTO_SETUP_NET_ETHERNET_ENABLED=0\nAUTO_SETUP_NET_WIFI_ENABLED=1\nAUTO_SETUP_NET_WIFI_COUNTRY_CODE=GB\nAUTO_SETUP_NET_HOSTNAME=mypi\nAUTO_SETUP_GLOBAL_PASSWORD=a-long-password\nAUTO_SETUP_AUTOMATED=1\n"
+            "AUTO_SETUP_NET_ETHERNET_ENABLED=0\nAUTO_SETUP_NET_WIFI_ENABLED=1\nAUTO_SETUP_NET_WIFI_COUNTRY_CODE=GB\nAUTO_SETUP_NET_HOSTNAME=mypi\nAUTO_SETUP_GLOBAL_PASSWORD=a-long-password\nAUTO_SETUP_SSH_SERVER_INDEX=-2\nAUTO_SETUP_AUTOMATED=1\n"
         );
     }
 
@@ -225,7 +226,7 @@ mod tests {
         let text = "AUTO_SETUP_NET_ETHERNET_ENABLED=0\nAUTO_SETUP_NET_WIFI_ENABLED=1\nAUTO_SETUP_NET_WIFI_COUNTRY_CODE=GB\n";
         assert_eq!(
             dietpi_txt(text, &settings(Connection::Ethernet)).unwrap(),
-            "AUTO_SETUP_NET_ETHERNET_ENABLED=1\nAUTO_SETUP_NET_WIFI_ENABLED=0\nAUTO_SETUP_NET_WIFI_COUNTRY_CODE=GB\nAUTO_SETUP_NET_HOSTNAME=mypi\nAUTO_SETUP_GLOBAL_PASSWORD=a-long-password\nAUTO_SETUP_AUTOMATED=1\n"
+            "AUTO_SETUP_NET_ETHERNET_ENABLED=1\nAUTO_SETUP_NET_WIFI_ENABLED=0\nAUTO_SETUP_NET_WIFI_COUNTRY_CODE=GB\nAUTO_SETUP_NET_HOSTNAME=mypi\nAUTO_SETUP_GLOBAL_PASSWORD=a-long-password\nAUTO_SETUP_SSH_SERVER_INDEX=-2\nAUTO_SETUP_AUTOMATED=1\n"
         );
     }
 
@@ -234,7 +235,16 @@ mod tests {
         let text = "#AUTO_SETUP_AUTOMATED=0\nAUTO_SETUP_GLOBAL_PASSWORD=dietpi\nAUTO_SETUP_NET_HOSTNAME=DietPi\nAUTO_SETUP_AUTOMATED=0\n";
         assert_eq!(
             dietpi_txt(text, &settings(Connection::Ethernet)).unwrap(),
-            "#AUTO_SETUP_AUTOMATED=0\nAUTO_SETUP_GLOBAL_PASSWORD=a-long-password\nAUTO_SETUP_NET_HOSTNAME=mypi\nAUTO_SETUP_AUTOMATED=1\nAUTO_SETUP_NET_WIFI_ENABLED=0\nAUTO_SETUP_NET_ETHERNET_ENABLED=1\n"
+            "#AUTO_SETUP_AUTOMATED=0\nAUTO_SETUP_GLOBAL_PASSWORD=a-long-password\nAUTO_SETUP_NET_HOSTNAME=mypi\nAUTO_SETUP_AUTOMATED=1\nAUTO_SETUP_NET_WIFI_ENABLED=0\nAUTO_SETUP_NET_ETHERNET_ENABLED=1\nAUTO_SETUP_SSH_SERVER_INDEX=-2\n"
+        );
+    }
+
+    #[test]
+    fn the_ssh_server_is_set_to_openssh_in_place_of_the_dropbear_default() {
+        let text = "# SSH server choice: 0=none/custom | -1=Dropbear | -2=OpenSSH\nAUTO_SETUP_SSH_SERVER_INDEX=-1\nAUTO_SETUP_AUTOMATED=0\n";
+        assert_eq!(
+            dietpi_txt(text, &wifi_settings()).unwrap(),
+            "# SSH server choice: 0=none/custom | -1=Dropbear | -2=OpenSSH\nAUTO_SETUP_SSH_SERVER_INDEX=-2\nAUTO_SETUP_AUTOMATED=1\nAUTO_SETUP_NET_WIFI_ENABLED=1\nAUTO_SETUP_NET_ETHERNET_ENABLED=0\nAUTO_SETUP_NET_WIFI_COUNTRY_CODE=GB\nAUTO_SETUP_NET_HOSTNAME=mypi\nAUTO_SETUP_GLOBAL_PASSWORD=a-long-password\n"
         );
     }
 
