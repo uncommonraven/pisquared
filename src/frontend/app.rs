@@ -24,7 +24,7 @@ use crate::backend::fetch::Verification;
 use crate::backend::network::Connection;
 use crate::backend::preferences::Preferences;
 use crate::backend::run::{Activity, Job, Obtained, RunError};
-use crate::frontend::{hostname, network, preferences, select, splash};
+use crate::frontend::{hostname, mesh_network, network, preferences, select, splash};
 
 pub struct Model {
     splash: Option<splash::Model>,
@@ -32,6 +32,7 @@ pub struct Model {
     choosing: Option<Choosing>,
     credentialing: Option<Credentialing>,
     hostnaming: Option<Hostnaming>,
+    mesh_networking: Option<MeshNetworking>,
     confirming: Option<Confirming>,
     output_dir: PathBuf,
     run: Option<Run>,
@@ -61,17 +62,30 @@ struct Hostnaming {
     hostname: hostname::Model,
 }
 
-/// A chosen device whose complete preferences, valid network, and valid hostname and password are shown for the operator
-/// to confirm before anything is downloaded.
+/// A chosen device whose complete preferences, valid network, and valid hostname and password are followed by its
+/// Mesh Network auth key.
+struct MeshNetworking {
+    device: &'static Device,
+    menus: preferences::Model,
+    preferences: Preferences,
+    network: network::Model,
+    hostname: hostname::Model,
+    mesh_network: mesh_network::Model,
+}
+
+/// A chosen device whose complete preferences, valid network, valid hostname and password, and valid Mesh Network auth key
+/// are shown for the operator to confirm before anything is downloaded.
 struct Confirming {
     device: &'static Device,
     menus: preferences::Model,
     preferences: Preferences,
     network: network::Model,
     hostname: hostname::Model,
+    mesh_network: mesh_network::Model,
     connection: Connection,
     name: String,
     password: String,
+    auth_key: String,
 }
 
 enum Run {
@@ -87,6 +101,7 @@ impl Model {
             choosing: None,
             credentialing: None,
             hostnaming: None,
+            mesh_networking: None,
             confirming: None,
             output_dir,
             run: None,
@@ -126,6 +141,9 @@ pub fn update(model: &mut Model, event: &Event) -> bool {
             }
             if let Some(confirming) = model.confirming.take() {
                 return confirm(model, confirming, key);
+            }
+            if let Some(mesh_networking) = model.mesh_networking.take() {
+                return authenticate(model, mesh_networking, key);
             }
             if let Some(hostnaming) = model.hostnaming.take() {
                 return name_host(model, hostnaming, key);
@@ -222,17 +240,15 @@ fn name_host(model: &mut Model, mut hostnaming: Hostnaming, key: &KeyEvent) -> b
             hostnaming.hostname.name(),
             hostnaming.hostname.password(),
         ) {
-            (Some(connection), Some(name), Some(password)) => {
+            (Some(_), Some(_), Some(_)) => {
                 hostnaming.hostname.leave();
-                model.confirming = Some(Confirming {
+                model.mesh_networking = Some(MeshNetworking {
                     device: hostnaming.device,
                     menus: hostnaming.menus,
                     preferences: hostnaming.preferences,
                     network: hostnaming.network,
                     hostname: hostnaming.hostname,
-                    connection,
-                    name,
-                    password,
+                    mesh_network: mesh_network::Model::default(),
                 });
             }
             _ => model.hostnaming = Some(hostnaming),
@@ -255,7 +271,55 @@ fn name_host(model: &mut Model, mut hostnaming: Hostnaming, key: &KeyEvent) -> b
     false
 }
 
-/// Applies a key on the confirmation view: Enter starts the run, Esc or Left returns to the Hostname page with its values
+/// Applies a key on the Mesh Network page: Enter continues once the auth key is valid, Left or Esc goes back to the Hostname
+/// page with its values kept, and Ctrl-C quits. Any other key edits the page.
+fn authenticate(model: &mut Model, mut mesh_networking: MeshNetworking, key: &KeyEvent) -> bool {
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        return true;
+    }
+    match key.code {
+        KeyCode::Enter => match (
+            mesh_networking.network.connection(),
+            mesh_networking.hostname.name(),
+            mesh_networking.hostname.password(),
+            mesh_networking.mesh_network.key(),
+        ) {
+            (Some(connection), Some(name), Some(password), Some(auth_key)) => {
+                mesh_networking.mesh_network.leave();
+                model.confirming = Some(Confirming {
+                    device: mesh_networking.device,
+                    menus: mesh_networking.menus,
+                    preferences: mesh_networking.preferences,
+                    network: mesh_networking.network,
+                    hostname: mesh_networking.hostname,
+                    mesh_network: mesh_networking.mesh_network,
+                    connection,
+                    name,
+                    password,
+                    auth_key,
+                });
+            }
+            _ => model.mesh_networking = Some(mesh_networking),
+        },
+        KeyCode::Esc | KeyCode::Left => {
+            mesh_networking.mesh_network.leave();
+            model.hostnaming = Some(Hostnaming {
+                device: mesh_networking.device,
+                menus: mesh_networking.menus,
+                preferences: mesh_networking.preferences,
+                network: mesh_networking.network,
+                hostname: mesh_networking.hostname,
+            });
+        }
+        _ => {
+            mesh_network::update(&mut mesh_networking.mesh_network, key);
+            model.mesh_networking = Some(mesh_networking);
+        }
+    }
+    false
+}
+
+/// Applies a key on the confirmation view: Enter starts the run, Esc or Left returns to the Mesh Network page with its values
 /// kept, and Ctrl-C quits. Any other key leaves the confirmation as it is.
 fn confirm(model: &mut Model, confirming: Confirming, key: &KeyEvent) -> bool {
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -267,6 +331,7 @@ fn confirm(model: &mut Model, confirming: Confirming, key: &KeyEvent) -> bool {
                 connection: confirming.connection,
                 hostname: confirming.name,
                 password: confirming.password,
+                mesh_network_auth_key: confirming.auth_key,
             };
             model.run = Some(Run::Active {
                 job: Job::start(confirming.device.id, settings, model.output_dir.clone()),
@@ -274,12 +339,13 @@ fn confirm(model: &mut Model, confirming: Confirming, key: &KeyEvent) -> bool {
             });
         }
         KeyCode::Esc | KeyCode::Left => {
-            model.hostnaming = Some(Hostnaming {
+            model.mesh_networking = Some(MeshNetworking {
                 device: confirming.device,
                 menus: confirming.menus,
                 preferences: confirming.preferences,
                 network: confirming.network,
                 hostname: confirming.hostname,
+                mesh_network: confirming.mesh_network,
             });
         }
         _ => model.confirming = Some(confirming),
@@ -304,7 +370,7 @@ pub fn tick(model: &mut Model) {
 const SECTIONS: [(&str, usize); 5] = [
     ("Device", 1),
     ("Preferences", 3),
-    ("Credentials", 2),
+    ("Credentials", 3),
     ("Confirm", 1),
     ("Download", 1),
 ];
@@ -314,16 +380,18 @@ fn position(model: &Model) -> (usize, usize) {
     match (
         &model.run,
         &model.confirming,
+        &model.mesh_networking,
         &model.hostnaming,
         &model.credentialing,
         &model.choosing,
     ) {
-        (Some(_), _, _, _, _) => (4, 0),
-        (None, Some(_), _, _, _) => (3, 0),
-        (None, None, Some(_), _, _) => (2, 1),
-        (None, None, None, Some(_), _) => (2, 0),
-        (None, None, None, None, Some(choosing)) => (1, choosing.menus.page()),
-        (None, None, None, None, None) => (0, 0),
+        (Some(_), _, _, _, _, _) => (4, 0),
+        (None, Some(_), _, _, _, _) => (3, 0),
+        (None, None, Some(_), _, _, _) => (2, 2),
+        (None, None, None, Some(_), _, _) => (2, 1),
+        (None, None, None, None, Some(_), _) => (2, 0),
+        (None, None, None, None, None, Some(choosing)) => (1, choosing.menus.page()),
+        (None, None, None, None, None, None) => (0, 0),
     }
 }
 
@@ -363,21 +431,25 @@ pub fn view(model: &Model, frame: &mut Frame) {
     match &model.run {
         None => match (
             &model.confirming,
+            &model.mesh_networking,
             &model.hostnaming,
             &model.credentialing,
             &model.choosing,
         ) {
-            (Some(confirming), _, _, _) => view_confirming(confirming, frame, body_area),
-            (None, Some(hostnaming), _, _) => {
+            (Some(confirming), _, _, _, _) => view_confirming(confirming, frame, body_area),
+            (None, Some(mesh_networking), _, _, _) => {
+                mesh_network::view(&mesh_networking.mesh_network, frame, body_area)
+            }
+            (None, None, Some(hostnaming), _, _) => {
                 hostname::view(&hostnaming.hostname, frame, body_area)
             }
-            (None, None, Some(credentialing), _) => {
+            (None, None, None, Some(credentialing), _) => {
                 network::view(&credentialing.network, frame, body_area)
             }
-            (None, None, None, Some(choosing)) => {
+            (None, None, None, None, Some(choosing)) => {
                 preferences::view(&choosing.menus, frame, body_area)
             }
-            (None, None, None, None) => select::view(&model.select, frame, body_area),
+            (None, None, None, None, None) => select::view(&model.select, frame, body_area),
         },
         Some(Run::Active { job, preferences }) => {
             view_active(job.current(), preferences, frame, body_area)
@@ -450,6 +522,7 @@ fn view_confirming(confirming: &Confirming, frame: &mut Frame, area: Rect) {
     lines.push(format!("Network: {}", confirming.connection));
     lines.push(format!("Hostname: {}", confirming.name));
     lines.push("Password: ********".to_owned());
+    lines.push("Mesh Network auth key: ********".to_owned());
     lines.push(
         "Press Enter to download and verify the image. Esc or Left goes back to change your choices. Ctrl-C quits.".to_owned(),
     );
@@ -523,6 +596,8 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
+    const MESH_NETWORK_KEY: &str = "tskey-auth-kABC123-xyz789";
+
     fn key(code: KeyCode, modifiers: KeyModifiers) -> Event {
         Event::Key(KeyEvent::new(code, modifiers))
     }
@@ -568,6 +643,12 @@ mod tests {
     fn complete_hostname(model: &mut Model) {
         update(model, &key(KeyCode::Down, KeyModifiers::NONE));
         type_text(model, "pi-squared-2026");
+        update(model, &key(KeyCode::Enter, KeyModifiers::NONE));
+    }
+
+    /// Enters a valid Mesh Network auth key on the Mesh Network page, and continues from it.
+    fn complete_mesh_network(model: &mut Model) {
+        type_text(model, MESH_NETWORK_KEY);
         update(model, &key(KeyCode::Enter, KeyModifiers::NONE));
     }
 
@@ -721,9 +802,36 @@ mod tests {
         complete_hostname(&mut model);
 
         assert!(model.hostnaming.is_none());
+        assert!(
+            model.mesh_networking.is_some(),
+            "the Mesh Network page is shown"
+        );
+        assert!(
+            model.confirming.is_none(),
+            "the Mesh Network key is not yet entered"
+        );
+
+        complete_mesh_network(&mut model);
+
+        assert!(model.mesh_networking.is_none());
         assert!(model.confirming.is_some(), "the confirmation is shown");
         assert!(model.choosing.is_none());
         assert!(model.run.is_none(), "confirming starts nothing");
+    }
+
+    #[test]
+    fn an_invalid_mesh_network_key_does_not_continue_to_the_confirmation() {
+        let mut model = started();
+        complete_preferences(&mut model);
+        complete_network(&mut model);
+        complete_hostname(&mut model);
+        type_text(&mut model, "auth-kABC123");
+
+        update(&mut model, &key(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(model.mesh_networking.is_some(), "the key is not yet valid");
+        assert!(model.confirming.is_none());
+        assert!(model.run.is_none());
     }
 
     #[test]
@@ -752,6 +860,11 @@ mod tests {
         assert!(model.hostnaming.is_some(), "the hostname page is shown");
 
         complete_hostname(&mut model);
+        assert!(
+            model.mesh_networking.is_some(),
+            "the Mesh Network page is shown"
+        );
+        complete_mesh_network(&mut model);
 
         assert!(model.hostnaming.is_none());
         assert!(matches!(
@@ -797,23 +910,28 @@ mod tests {
     }
 
     #[test]
-    fn escape_on_the_confirmation_returns_to_the_hostname_page_and_keeps_the_network() {
+    fn escape_on_the_confirmation_returns_to_the_mesh_network_page_and_keeps_the_network() {
         let mut model = started();
         complete_preferences(&mut model);
         complete_network(&mut model);
         complete_hostname(&mut model);
+        complete_mesh_network(&mut model);
 
         assert!(!update(&mut model, &key(KeyCode::Esc, KeyModifiers::NONE)));
 
         assert!(model.confirming.is_none());
-        let hostnaming = model
-            .hostnaming
+        let mesh_networking = model
+            .mesh_networking
             .as_ref()
-            .expect("back on the hostname page");
+            .expect("back on the Mesh Network page");
         assert!(matches!(
-            hostnaming.network.connection(),
+            mesh_networking.network.connection(),
             Some(Connection::Wifi(wifi)) if wifi.ssid == "Home"
         ));
+        assert_eq!(
+            mesh_networking.mesh_network.key(),
+            Some(MESH_NETWORK_KEY.to_owned())
+        );
         assert!(model.run.is_none());
     }
 
@@ -823,6 +941,7 @@ mod tests {
         complete_preferences(&mut model);
         complete_network(&mut model);
         complete_hostname(&mut model);
+        complete_mesh_network(&mut model);
 
         let mut terminal = Terminal::new(TestBackend::new(120, 20)).unwrap();
         terminal.draw(|frame| view(&model, frame)).unwrap();
@@ -855,8 +974,13 @@ mod tests {
         );
         assert!(rendered.contains("Hostname: pisquared"), "{rendered}");
         assert!(rendered.contains("Password: ********"), "{rendered}");
+        assert!(
+            rendered.contains("Mesh Network auth key: ********"),
+            "{rendered}"
+        );
         assert!(!rendered.contains("correct horse"), "{rendered}");
         assert!(!rendered.contains("pi-squared-2026"), "{rendered}");
+        assert!(!rendered.contains(MESH_NETWORK_KEY), "{rendered}");
     }
 
     #[test]
@@ -905,10 +1029,19 @@ mod tests {
         complete_network(&mut model);
         assert!(model.hostnaming.is_some());
         complete_hostname(&mut model);
+        assert!(model.mesh_networking.is_some());
+        complete_mesh_network(&mut model);
         assert!(model.confirming.is_some());
 
         update(&mut model, &key(KeyCode::Left, KeyModifiers::NONE));
         assert!(model.confirming.is_none());
+        assert!(
+            model.mesh_networking.is_some(),
+            "back on the Mesh Network page"
+        );
+
+        update(&mut model, &key(KeyCode::Left, KeyModifiers::NONE));
+        assert!(model.mesh_networking.is_none());
         assert!(model.hostnaming.is_some(), "back on the hostname page");
 
         update(&mut model, &key(KeyCode::Left, KeyModifiers::NONE));
@@ -947,7 +1080,7 @@ mod tests {
         let progress: String = (0..120).map(|x| buffer[(x, 0)].symbol()).collect();
 
         assert!(
-            progress.contains("✓ Device › ✓ Preferences › Credentials 1/2 › Confirm › Download"),
+            progress.contains("✓ Device › ✓ Preferences › Credentials 1/3 › Confirm › Download"),
             "{progress}"
         );
     }
@@ -964,7 +1097,25 @@ mod tests {
         let progress: String = (0..120).map(|x| buffer[(x, 0)].symbol()).collect();
 
         assert!(
-            progress.contains("✓ Device › ✓ Preferences › Credentials 2/2 › Confirm › Download"),
+            progress.contains("✓ Device › ✓ Preferences › Credentials 2/3 › Confirm › Download"),
+            "{progress}"
+        );
+    }
+
+    #[test]
+    fn the_mesh_network_page_is_the_third_credentials_page_in_the_progress_line() {
+        let mut model = started();
+        complete_preferences(&mut model);
+        complete_network(&mut model);
+        complete_hostname(&mut model);
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 20)).unwrap();
+        terminal.draw(|frame| view(&model, frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let progress: String = (0..120).map(|x| buffer[(x, 0)].symbol()).collect();
+
+        assert!(
+            progress.contains("✓ Device › ✓ Preferences › Credentials 3/3 › Confirm › Download"),
             "{progress}"
         );
     }

@@ -1,5 +1,6 @@
 //! Writes the operator's choices into `dietpi.txt` and `dietpi-wifi.txt`, following IMG-2 to IMG-7 of the credentials
-//! requirements, and the hostname and password of the Hostname page.
+//! requirements, and the hostname and password of the Hostname page. Also adds the LSM stack to `cmdline.txt`, and
+//! writes the Mesh Network auth key of the Mesh Network page into `user-defined-credentials.txt`, with the script that uses it.
 //!
 //! The edits are split in two. The functions that compute new text work on strings and know nothing about where the text
 //! came from. The functions that read and write a file keep the file open for the whole edit. The image step can reuse
@@ -13,12 +14,45 @@ use super::network::{Connection, Wifi};
 
 pub const DIETPI: &str = "dietpi.txt";
 pub const DIETPI_WIFI: &str = "dietpi-wifi.txt";
+pub const CMDLINE: &str = "cmdline.txt";
+pub const CREDENTIALS: &str = "user-defined-credentials.txt";
+pub const SCRIPT: &str = "Automation_Custom_Script.sh";
 
-/// What the operator chose for the Network and Hostname pages, as written into the boot partition.
+/// The script DietPi runs after first-run setup (`AUTO_SETUP_CUSTOM_SCRIPT_EXEC=0`). It joins the Mesh Network with
+/// the auth key from `user-defined-credentials.txt`, and deletes that file on exit, whether or not the join succeeded.
+pub const AUTOMATION_SCRIPT: &str = r#"#!/bin/bash
+# Joins this Pi to the Mesh Network using the auth key entered in the TUI, then removes the key from the boot
+# partition. The key is removed on exit, so it is gone even when tailscale up fails.
+CREDENTIALS=/boot/firmware/user-defined-credentials.txt
+if [ ! -f "$CREDENTIALS" ]; then
+    CREDENTIALS=/boot/user-defined-credentials.txt
+fi
+trap 'rm -f "$CREDENTIALS"' EXIT
+
+key=
+if [ -f "$CREDENTIALS" ]; then
+    key=$(sed -n 's/^MESH_NETWORK_AUTH_KEY=//p' "$CREDENTIALS" | head -n 1)
+fi
+if [ -z "$key" ]; then
+    echo "Mesh Network: no auth key in $CREDENTIALS, so Mesh Network is not joined"
+    exit 0
+fi
+
+if sudo tailscale up --ssh --auth-key="$key"; then
+    echo "Mesh Network: joined the network"
+else
+    echo "Mesh Network: tailscale up failed, so Mesh Network is not joined"
+fi
+"#;
+
+const LSM: &str = "lsm=landlock,lockdown,yama,integrity,apparmor";
+
+/// What the operator chose for the Network, Hostname, and Mesh Network pages, as written into the boot partition.
 pub struct Settings {
     pub connection: Connection,
     pub hostname: String,
     pub password: String,
+    pub mesh_network_auth_key: String,
 }
 
 #[derive(Debug, Error)]
@@ -33,13 +67,17 @@ pub enum ConfigureError {
     LineBreak { key: &'static str },
 }
 
-/// Sets `settings` in two files that are already open for editing, such as files on a FAT volume.
+/// Sets `settings` in four files that are already open for editing, such as files on a FAT volume.
 ///
-/// Both files must exist, but `dietpi-wifi.txt` is written only for Wi-Fi (IMG-7). Both new texts are computed before
-/// either is written, so a value that cannot be written leaves both files as they were.
+/// The first three must exist, but `dietpi-wifi.txt` is written only for Wi-Fi (IMG-7). `credentials` and `script` are
+/// the new, empty `user-defined-credentials.txt` and `Automation_Custom_Script.sh`, which are written in full. All new
+/// texts are computed before any is written, so a value that cannot be written leaves every file as it was.
 pub fn configure_files<F: Editable>(
     dietpi: &mut F,
     dietpi_wifi: &mut F,
+    cmdline: &mut F,
+    credentials: &mut F,
+    script: &mut F,
     settings: &Settings,
 ) -> Result<(), ConfigureError> {
     let dietpi_text = dietpi_txt(&read_text(dietpi, DIETPI)?, settings)?;
@@ -50,12 +88,16 @@ pub fn configure_files<F: Editable>(
         )?),
         Connection::Ethernet => None,
     };
+    let cmdline_text = cmdline_txt(&read_text(cmdline, CMDLINE)?);
+    let credentials_text = credentials_txt(settings)?;
 
     write_text(dietpi, DIETPI, &dietpi_text)?;
-    match dietpi_wifi_text {
-        Some(text) => write_text(dietpi_wifi, DIETPI_WIFI, &text),
-        None => Ok(()),
+    if let Some(text) = dietpi_wifi_text {
+        write_text(dietpi_wifi, DIETPI_WIFI, &text)?;
     }
+    write_text(cmdline, CMDLINE, &cmdline_text)?;
+    write_text(credentials, CREDENTIALS, &credentials_text)?;
+    write_text(script, SCRIPT, AUTOMATION_SCRIPT)
 }
 
 /// A file that can be edited where it is: read, written, cut short at the position it was last written to, and saved.
@@ -114,7 +156,15 @@ pub fn dietpi_txt(text: &str, settings: &Settings) -> Result<String, ConfigureEr
         plain("AUTO_SETUP_GLOBAL_PASSWORD", &settings.password)?,
     );
     let text = set_line(&text, "AUTO_SETUP_SSH_SERVER_INDEX", "-2");
+    let text = enable_line(&text, "AUTO_SETUP_INSTALL_SOFTWARE_ID", "9 58");
+    let text = set_line(&text, "AUTO_SETUP_CUSTOM_SCRIPT_EXEC", "0");
     Ok(set_line(&text, "AUTO_SETUP_AUTOMATED", "1"))
+}
+
+/// The single line of `user-defined-credentials.txt`, which holds the Mesh Network auth key for the first-boot script.
+pub fn credentials_txt(settings: &Settings) -> Result<String, ConfigureError> {
+    let key = plain("MESH_NETWORK_AUTH_KEY", &settings.mesh_network_auth_key)?;
+    Ok(format!("MESH_NETWORK_AUTH_KEY={key}\n"))
 }
 
 /// Refuses a value that contains a line break, since it would end its line early, and otherwise returns it.
@@ -132,6 +182,19 @@ pub fn dietpi_wifi_txt(text: &str, wifi: &Wifi) -> Result<String, ConfigureError
     let text = set_line(text, "aWIFI_SSID[0]", &ssid);
     let text = set_line(&text, "aWIFI_KEY[0]", &key);
     Ok(set_line(&text, "aWIFI_KEYMGR[0]", "'WPA-PSK'"))
+}
+
+/// The single line of `cmdline.txt`, with the `lsm=` parameter appended. An `lsm=` parameter already on the line is
+/// dropped first, so the result is the same whether or not the file was configured before.
+pub fn cmdline_txt(text: &str) -> String {
+    let ending = line_ending(text);
+    let mut tokens: Vec<&str> = text
+        .trim_end_matches(['\r', '\n'])
+        .split_whitespace()
+        .filter(|token| !token.starts_with("lsm="))
+        .collect();
+    tokens.push(LSM);
+    format!("{}{ending}", tokens.join(" "))
 }
 
 /// Replaces the value of the first uncommented line whose key is `key`, or appends `key=value` when there is none.
@@ -162,6 +225,30 @@ fn set_line(text: &str, key: &str, value: &str) -> String {
         out.push_str(ending);
     }
     out
+}
+
+/// Like `set_line`, but when the key has no uncommented line yet, the first commented-out assignment to it (such as the
+/// `#KEY=...` examples in the file) is uncommented in place and given `value`.
+fn enable_line(text: &str, key: &str, value: &str) -> String {
+    let uncommented = text.split_inclusive('\n').any(|line| assigns(line, key));
+    let commented = text.split_inclusive('\n').position(|line| {
+        line.strip_prefix('#')
+            .is_some_and(|rest| assigns(rest, key))
+    });
+    match (uncommented, commented) {
+        (false, Some(index)) => text
+            .split_inclusive('\n')
+            .enumerate()
+            .map(|(i, line)| {
+                if i == index {
+                    format!("{key}={value}{}", line_ending(line))
+                } else {
+                    line.to_owned()
+                }
+            })
+            .collect(),
+        _ => set_line(text, key, value),
+    }
 }
 
 /// Whether the line is an assignment to `key`. The key is the text before the first `=`, compared exactly, so a commented
@@ -205,6 +292,7 @@ mod tests {
             connection,
             hostname: "mypi".to_owned(),
             password: "a-long-password".to_owned(),
+            mesh_network_auth_key: "tskey-auth-kABC123-xyz789".to_owned(),
         }
     }
 
@@ -217,7 +305,7 @@ mod tests {
         let text = "AUTO_SETUP_NET_ETHERNET_ENABLED=1\nAUTO_SETUP_NET_WIFI_ENABLED=0\n";
         assert_eq!(
             dietpi_txt(text, &wifi_settings()).unwrap(),
-            "AUTO_SETUP_NET_ETHERNET_ENABLED=0\nAUTO_SETUP_NET_WIFI_ENABLED=1\nAUTO_SETUP_NET_WIFI_COUNTRY_CODE=GB\nAUTO_SETUP_NET_HOSTNAME=mypi\nAUTO_SETUP_GLOBAL_PASSWORD=a-long-password\nAUTO_SETUP_SSH_SERVER_INDEX=-2\nAUTO_SETUP_AUTOMATED=1\n"
+            "AUTO_SETUP_NET_ETHERNET_ENABLED=0\nAUTO_SETUP_NET_WIFI_ENABLED=1\nAUTO_SETUP_NET_WIFI_COUNTRY_CODE=GB\nAUTO_SETUP_NET_HOSTNAME=mypi\nAUTO_SETUP_GLOBAL_PASSWORD=a-long-password\nAUTO_SETUP_SSH_SERVER_INDEX=-2\nAUTO_SETUP_INSTALL_SOFTWARE_ID=9 58\nAUTO_SETUP_CUSTOM_SCRIPT_EXEC=0\nAUTO_SETUP_AUTOMATED=1\n"
         );
     }
 
@@ -226,7 +314,7 @@ mod tests {
         let text = "AUTO_SETUP_NET_ETHERNET_ENABLED=0\nAUTO_SETUP_NET_WIFI_ENABLED=1\nAUTO_SETUP_NET_WIFI_COUNTRY_CODE=GB\n";
         assert_eq!(
             dietpi_txt(text, &settings(Connection::Ethernet)).unwrap(),
-            "AUTO_SETUP_NET_ETHERNET_ENABLED=1\nAUTO_SETUP_NET_WIFI_ENABLED=0\nAUTO_SETUP_NET_WIFI_COUNTRY_CODE=GB\nAUTO_SETUP_NET_HOSTNAME=mypi\nAUTO_SETUP_GLOBAL_PASSWORD=a-long-password\nAUTO_SETUP_SSH_SERVER_INDEX=-2\nAUTO_SETUP_AUTOMATED=1\n"
+            "AUTO_SETUP_NET_ETHERNET_ENABLED=1\nAUTO_SETUP_NET_WIFI_ENABLED=0\nAUTO_SETUP_NET_WIFI_COUNTRY_CODE=GB\nAUTO_SETUP_NET_HOSTNAME=mypi\nAUTO_SETUP_GLOBAL_PASSWORD=a-long-password\nAUTO_SETUP_SSH_SERVER_INDEX=-2\nAUTO_SETUP_INSTALL_SOFTWARE_ID=9 58\nAUTO_SETUP_CUSTOM_SCRIPT_EXEC=0\nAUTO_SETUP_AUTOMATED=1\n"
         );
     }
 
@@ -235,7 +323,7 @@ mod tests {
         let text = "#AUTO_SETUP_AUTOMATED=0\nAUTO_SETUP_GLOBAL_PASSWORD=dietpi\nAUTO_SETUP_NET_HOSTNAME=DietPi\nAUTO_SETUP_AUTOMATED=0\n";
         assert_eq!(
             dietpi_txt(text, &settings(Connection::Ethernet)).unwrap(),
-            "#AUTO_SETUP_AUTOMATED=0\nAUTO_SETUP_GLOBAL_PASSWORD=a-long-password\nAUTO_SETUP_NET_HOSTNAME=mypi\nAUTO_SETUP_AUTOMATED=1\nAUTO_SETUP_NET_WIFI_ENABLED=0\nAUTO_SETUP_NET_ETHERNET_ENABLED=1\nAUTO_SETUP_SSH_SERVER_INDEX=-2\n"
+            "#AUTO_SETUP_AUTOMATED=0\nAUTO_SETUP_GLOBAL_PASSWORD=a-long-password\nAUTO_SETUP_NET_HOSTNAME=mypi\nAUTO_SETUP_AUTOMATED=1\nAUTO_SETUP_NET_WIFI_ENABLED=0\nAUTO_SETUP_NET_ETHERNET_ENABLED=1\nAUTO_SETUP_SSH_SERVER_INDEX=-2\nAUTO_SETUP_INSTALL_SOFTWARE_ID=9 58\nAUTO_SETUP_CUSTOM_SCRIPT_EXEC=0\n"
         );
     }
 
@@ -244,7 +332,7 @@ mod tests {
         let text = "# SSH server choice: 0=none/custom | -1=Dropbear | -2=OpenSSH\nAUTO_SETUP_SSH_SERVER_INDEX=-1\nAUTO_SETUP_AUTOMATED=0\n";
         assert_eq!(
             dietpi_txt(text, &wifi_settings()).unwrap(),
-            "# SSH server choice: 0=none/custom | -1=Dropbear | -2=OpenSSH\nAUTO_SETUP_SSH_SERVER_INDEX=-2\nAUTO_SETUP_AUTOMATED=1\nAUTO_SETUP_NET_WIFI_ENABLED=1\nAUTO_SETUP_NET_ETHERNET_ENABLED=0\nAUTO_SETUP_NET_WIFI_COUNTRY_CODE=GB\nAUTO_SETUP_NET_HOSTNAME=mypi\nAUTO_SETUP_GLOBAL_PASSWORD=a-long-password\n"
+            "# SSH server choice: 0=none/custom | -1=Dropbear | -2=OpenSSH\nAUTO_SETUP_SSH_SERVER_INDEX=-2\nAUTO_SETUP_AUTOMATED=1\nAUTO_SETUP_NET_WIFI_ENABLED=1\nAUTO_SETUP_NET_ETHERNET_ENABLED=0\nAUTO_SETUP_NET_WIFI_COUNTRY_CODE=GB\nAUTO_SETUP_NET_HOSTNAME=mypi\nAUTO_SETUP_GLOBAL_PASSWORD=a-long-password\nAUTO_SETUP_INSTALL_SOFTWARE_ID=9 58\nAUTO_SETUP_CUSTOM_SCRIPT_EXEC=0\n"
         );
     }
 
@@ -273,6 +361,24 @@ mod tests {
                 key: "AUTO_SETUP_NET_HOSTNAME"
             })
         ));
+    }
+
+    #[test]
+    fn the_commented_software_example_is_uncommented_in_place() {
+        let text = "#AUTO_SETUP_INSTALL_SOFTWARE_ID=23 28 31\n##### Non-interactive first run setup #####\nAUTO_SETUP_AUTOMATED=0\n";
+        assert_eq!(
+            enable_line(text, "AUTO_SETUP_INSTALL_SOFTWARE_ID", "9 58"),
+            "AUTO_SETUP_INSTALL_SOFTWARE_ID=9 58\n##### Non-interactive first run setup #####\nAUTO_SETUP_AUTOMATED=0\n"
+        );
+    }
+
+    #[test]
+    fn the_custom_script_flag_is_enabled_in_place() {
+        let text = "AUTO_SETUP_CUSTOM_SCRIPT_EXEC=0\nAUTO_SETUP_BACKUP_RESTORE=0\n";
+        assert_eq!(
+            set_line(text, "AUTO_SETUP_CUSTOM_SCRIPT_EXEC", "1"),
+            "AUTO_SETUP_CUSTOM_SCRIPT_EXEC=1\nAUTO_SETUP_BACKUP_RESTORE=0\n"
+        );
     }
 
     #[test]
@@ -305,6 +411,69 @@ mod tests {
     fn a_replaced_line_keeps_its_line_ending() {
         assert_eq!(set_line("A=1\r\nB=2\r\n", "A", "9"), "A=9\r\nB=2\r\n");
         assert_eq!(set_line("A=1", "A", "9"), "A=9");
+    }
+
+    #[test]
+    fn the_lsm_stack_is_appended_to_the_cmdline_and_keeps_its_line_ending() {
+        let text = "root=PARTUUID=d6e7fee7-02 rootfstype=ext4 rootwait console=tty1\n";
+        assert_eq!(
+            cmdline_txt(text),
+            "root=PARTUUID=d6e7fee7-02 rootfstype=ext4 rootwait console=tty1 lsm=landlock,lockdown,yama,integrity,apparmor\n"
+        );
+        assert_eq!(
+            cmdline_txt("console=tty1"),
+            "console=tty1 lsm=landlock,lockdown,yama,integrity,apparmor"
+        );
+        assert_eq!(
+            cmdline_txt("console=tty1\r\n"),
+            "console=tty1 lsm=landlock,lockdown,yama,integrity,apparmor\r\n"
+        );
+    }
+
+    #[test]
+    fn an_existing_lsm_parameter_is_replaced_so_configuring_twice_is_stable() {
+        let once = cmdline_txt("console=tty1 lsm=selinux,bpf\n");
+        assert_eq!(
+            once,
+            "console=tty1 lsm=landlock,lockdown,yama,integrity,apparmor\n"
+        );
+        assert_eq!(cmdline_txt(&once), once);
+    }
+
+    #[test]
+    fn the_credentials_file_holds_the_key_on_one_line() {
+        assert_eq!(
+            credentials_txt(&wifi_settings()).unwrap(),
+            "MESH_NETWORK_AUTH_KEY=tskey-auth-kABC123-xyz789\n"
+        );
+    }
+
+    #[test]
+    fn the_automation_script_removes_the_key_file_on_exit_and_never_prints_the_key() {
+        assert!(AUTOMATION_SCRIPT.starts_with("#!/bin/bash\n"));
+        assert!(
+            AUTOMATION_SCRIPT.contains("CREDENTIALS=/boot/firmware/user-defined-credentials.txt\n")
+        );
+        assert!(AUTOMATION_SCRIPT.contains("trap 'rm -f \"$CREDENTIALS\"' EXIT\n"));
+        assert!(AUTOMATION_SCRIPT.contains("sudo tailscale up --ssh --auth-key=\"$key\""));
+        assert!(!AUTOMATION_SCRIPT.contains("echo \"$key\""));
+        assert!(!AUTOMATION_SCRIPT.contains("tskey-"));
+    }
+
+    #[test]
+    fn a_line_break_in_the_key_is_refused_without_echoing_it() {
+        let key = Settings {
+            mesh_network_auth_key: "tskey-abc\nAUTO_SETUP_AUTOMATED=0".to_owned(),
+            ..wifi_settings()
+        };
+        let error = credentials_txt(&key).unwrap_err();
+        assert!(matches!(
+            error,
+            ConfigureError::LineBreak {
+                key: "MESH_NETWORK_AUTH_KEY"
+            }
+        ));
+        assert!(!error.to_string().contains("tskey"));
     }
 
     #[test]

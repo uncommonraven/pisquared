@@ -11,7 +11,9 @@ use fatfs::{Dir, File, FileSystem, FsOptions, ReadWriteSeek};
 use fscommon::StreamSlice;
 use thiserror::Error;
 
-use super::configure::{self, ConfigureError, DIETPI, DIETPI_WIFI, Editable, Settings};
+use super::configure::{
+    self, CMDLINE, CREDENTIALS, ConfigureError, DIETPI, DIETPI_WIFI, Editable, SCRIPT, Settings,
+};
 use super::partition::{self, PartitionError};
 
 #[derive(Debug, Error)]
@@ -36,7 +38,8 @@ pub fn configure_image(image: &Path, settings: &Settings) -> Result<(), ImageErr
     configure_disk(&mut file, settings)
 }
 
-/// Sets `settings` in the first partition of a disk, which must be a FAT partition.
+/// Sets `settings` in the first partition of a disk, which must be a FAT partition. The new files are created here,
+/// after the files that must already exist are open, and all of them are removed again if the configuration fails.
 pub fn configure_disk<D: Read + Write + Seek>(
     disk: &mut D,
     settings: &Settings,
@@ -48,7 +51,31 @@ pub fn configure_disk<D: Read + Write + Seek>(
         let root = fs.root_dir();
         let mut dietpi = open(&root, DIETPI)?;
         let mut dietpi_wifi = open(&root, DIETPI_WIFI)?;
-        configure::configure_files(&mut dietpi, &mut dietpi_wifi, settings)?;
+        let mut cmdline = open(&root, CMDLINE)?;
+        let mut credentials = create(&root, CREDENTIALS)?;
+        let mut script = match create(&root, SCRIPT) {
+            Ok(script) => script,
+            Err(err) => {
+                drop(credentials);
+                let _ = root.remove(CREDENTIALS);
+                return Err(err.into());
+            }
+        };
+        let result = configure::configure_files(
+            &mut dietpi,
+            &mut dietpi_wifi,
+            &mut cmdline,
+            &mut credentials,
+            &mut script,
+            settings,
+        );
+        drop(credentials);
+        drop(script);
+        if result.is_err() {
+            let _ = root.remove(CREDENTIALS);
+            let _ = root.remove(SCRIPT);
+        }
+        result?;
     }
     fs.unmount().map_err(ImageError::Volume)
 }
@@ -58,6 +85,14 @@ fn open<'a, T: ReadWriteSeek>(
     name: &'static str,
 ) -> Result<File<'a, T>, ConfigureError> {
     root.open_file(name)
+        .map_err(|source| ConfigureError::Io { file: name, source })
+}
+
+fn create<'a, T: ReadWriteSeek>(
+    root: &Dir<'a, T>,
+    name: &'static str,
+) -> Result<File<'a, T>, ConfigureError> {
+    root.create_file(name)
         .map_err(|source| ConfigureError::Io { file: name, source })
 }
 
@@ -92,6 +127,8 @@ mod tests {
 
     const DIETPI_TXT: &str = "AUTO_SETUP_NET_ETHERNET_ENABLED=1\nAUTO_SETUP_NET_WIFI_ENABLED=0\nAUTO_SETUP_NET_WIFI_COUNTRY_CODE=GB\n";
     const DIETPI_WIFI_TXT: &str = "aWIFI_SSID[0]=''\naWIFI_KEY[0]=''\naWIFI_KEYMGR[0]='WPA-PSK'\n";
+    const CMDLINE_TXT: &str = "root=PARTUUID=d6e7fee7-02 rootfstype=ext4 rootwait fsck.repair=yes net.ifnames=0 logo.nologo console=serial0,115200 console=tty1\n";
+    const CMDLINE_CONFIGURED: &str = "root=PARTUUID=d6e7fee7-02 rootfstype=ext4 rootwait fsck.repair=yes net.ifnames=0 logo.nologo console=serial0,115200 console=tty1 lsm=landlock,lockdown,yama,integrity,apparmor\n";
 
     fn home() -> Wifi {
         Wifi {
@@ -106,6 +143,7 @@ mod tests {
             connection: Connection::Wifi(home()),
             hostname: "mypi".to_owned(),
             password: "a-long-password".to_owned(),
+            mesh_network_auth_key: "tskey-auth-kABC123-xyz789".to_owned(),
         }
     }
 
@@ -188,21 +226,39 @@ mod tests {
         text
     }
 
-    fn standard_files() -> [(&'static str, &'static str); 2] {
+    fn file_exists(disk: &mut Cursor<Vec<u8>>, name: &str) -> bool {
+        let start = FAT_FIRST_SECTOR * SECTOR;
+        let end = start + FAT_SECTORS * SECTOR;
+        let mut slice = StreamSlice::new(disk, start, end).unwrap();
+        let fs = FileSystem::new(&mut slice, FsOptions::new()).unwrap();
+        fs.root_dir().open_file(name).is_ok()
+    }
+
+    fn standard_files() -> [(&'static str, &'static str); 3] {
         [
             ("dietpi.txt", DIETPI_TXT),
             ("dietpi-wifi.txt", DIETPI_WIFI_TXT),
+            ("cmdline.txt", CMDLINE_TXT),
         ]
     }
 
     fn assert_configured(disk: &mut Cursor<Vec<u8>>) {
         assert_eq!(
             read_file(disk, "dietpi.txt"),
-            "AUTO_SETUP_NET_ETHERNET_ENABLED=0\nAUTO_SETUP_NET_WIFI_ENABLED=1\nAUTO_SETUP_NET_WIFI_COUNTRY_CODE=GB\nAUTO_SETUP_NET_HOSTNAME=mypi\nAUTO_SETUP_GLOBAL_PASSWORD=a-long-password\nAUTO_SETUP_SSH_SERVER_INDEX=-2\nAUTO_SETUP_AUTOMATED=1\n"
+            "AUTO_SETUP_NET_ETHERNET_ENABLED=0\nAUTO_SETUP_NET_WIFI_ENABLED=1\nAUTO_SETUP_NET_WIFI_COUNTRY_CODE=GB\nAUTO_SETUP_NET_HOSTNAME=mypi\nAUTO_SETUP_GLOBAL_PASSWORD=a-long-password\nAUTO_SETUP_SSH_SERVER_INDEX=-2\nAUTO_SETUP_INSTALL_SOFTWARE_ID=9 58\nAUTO_SETUP_CUSTOM_SCRIPT_EXEC=0\nAUTO_SETUP_AUTOMATED=1\n"
         );
         assert_eq!(
             read_file(disk, "dietpi-wifi.txt"),
             "aWIFI_SSID[0]='Home Network'\naWIFI_KEY[0]='it'\\''s a test'\naWIFI_KEYMGR[0]='WPA-PSK'\n"
+        );
+        assert_eq!(read_file(disk, "cmdline.txt"), CMDLINE_CONFIGURED);
+        assert_eq!(
+            read_file(disk, "user-defined-credentials.txt"),
+            "MESH_NETWORK_AUTH_KEY=tskey-auth-kABC123-xyz789\n"
+        );
+        assert_eq!(
+            read_file(disk, "Automation_Custom_Script.sh"),
+            configure::AUTOMATION_SCRIPT
         );
     }
 
@@ -263,8 +319,9 @@ mod tests {
         assert_eq!(read_file(&mut disk, "dietpi-wifi.txt"), DIETPI_WIFI_TXT);
         assert_eq!(
             read_file(&mut disk, "dietpi.txt"),
-            "AUTO_SETUP_NET_ETHERNET_ENABLED=1\nAUTO_SETUP_NET_WIFI_ENABLED=0\nAUTO_SETUP_NET_WIFI_COUNTRY_CODE=GB\nAUTO_SETUP_NET_HOSTNAME=mypi\nAUTO_SETUP_GLOBAL_PASSWORD=a-long-password\nAUTO_SETUP_SSH_SERVER_INDEX=-2\nAUTO_SETUP_AUTOMATED=1\n"
+            "AUTO_SETUP_NET_ETHERNET_ENABLED=1\nAUTO_SETUP_NET_WIFI_ENABLED=0\nAUTO_SETUP_NET_WIFI_COUNTRY_CODE=GB\nAUTO_SETUP_NET_HOSTNAME=mypi\nAUTO_SETUP_GLOBAL_PASSWORD=a-long-password\nAUTO_SETUP_SSH_SERVER_INDEX=-2\nAUTO_SETUP_INSTALL_SOFTWARE_ID=9 58\nAUTO_SETUP_CUSTOM_SCRIPT_EXEC=0\nAUTO_SETUP_AUTOMATED=1\n"
         );
+        assert_eq!(read_file(&mut disk, "cmdline.txt"), CMDLINE_CONFIGURED);
     }
 
     #[test]
@@ -279,6 +336,28 @@ mod tests {
             }))
         ));
         assert_eq!(read_file(&mut disk, "dietpi-wifi.txt"), DIETPI_WIFI_TXT);
+        assert!(!file_exists(&mut disk, "user-defined-credentials.txt"));
+        assert!(!file_exists(&mut disk, "Automation_Custom_Script.sh"));
+    }
+
+    #[test]
+    fn a_key_that_cannot_be_written_leaves_the_files_unchanged_and_creates_nothing() {
+        let mut disk = fat_disk(FAT_TYPE, &standard_files());
+        let broken = Settings {
+            mesh_network_auth_key: "tskey-abc\nAUTO_SETUP_AUTOMATED=0".to_owned(),
+            ..settings()
+        };
+
+        assert!(matches!(
+            configure_disk(&mut disk, &broken),
+            Err(ImageError::Configure(ConfigureError::LineBreak {
+                key: "MESH_NETWORK_AUTH_KEY"
+            }))
+        ));
+        assert!(!file_exists(&mut disk, "user-defined-credentials.txt"));
+        assert!(!file_exists(&mut disk, "Automation_Custom_Script.sh"));
+        assert_eq!(read_file(&mut disk, "dietpi.txt"), DIETPI_TXT);
+        assert_eq!(read_file(&mut disk, "cmdline.txt"), CMDLINE_TXT);
     }
 
     #[test]
@@ -287,12 +366,39 @@ mod tests {
         let long_wifi = "aWIFI_SSID[0]='a very long network name that is replaced'\naWIFI_KEY[0]=''\naWIFI_KEYMGR[0]='WPA-PSK'\n";
         let mut disk = fat_disk(
             FAT_TYPE,
-            &[("dietpi.txt", long_dietpi), ("dietpi-wifi.txt", long_wifi)],
+            &[
+                ("dietpi.txt", long_dietpi),
+                ("dietpi-wifi.txt", long_wifi),
+                ("cmdline.txt", CMDLINE_TXT),
+            ],
         );
 
         configure_disk(&mut disk, &settings()).unwrap();
 
         assert_configured(&mut disk);
+    }
+
+    #[test]
+    fn a_missing_cmdline_fails_and_leaves_the_other_files_untouched() {
+        let mut disk = fat_disk(
+            FAT_TYPE,
+            &[
+                ("dietpi.txt", DIETPI_TXT),
+                ("dietpi-wifi.txt", DIETPI_WIFI_TXT),
+            ],
+        );
+
+        assert!(matches!(
+            configure_disk(&mut disk, &settings()),
+            Err(ImageError::Configure(ConfigureError::Io {
+                file: "cmdline.txt",
+                ..
+            }))
+        ));
+        assert_eq!(read_file(&mut disk, "dietpi.txt"), DIETPI_TXT);
+        assert_eq!(read_file(&mut disk, "dietpi-wifi.txt"), DIETPI_WIFI_TXT);
+        assert!(!file_exists(&mut disk, "user-defined-credentials.txt"));
+        assert!(!file_exists(&mut disk, "Automation_Custom_Script.sh"));
     }
 
     #[test]

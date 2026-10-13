@@ -316,7 +316,7 @@ async fn configure_image(
             log.record(
                 Step::Configure,
                 format!(
-                    "choices written to the boot partition of {}; the Wi-Fi passphrase, if any, and the password are stored there in plain text",
+                    "choices written to the boot partition of {}; the Wi-Fi passphrase, if any, the password, and the Mesh Network auth key are stored there in plain text",
                     flashable.display()
                 ),
             );
@@ -416,6 +416,7 @@ impl Job {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::configure::AUTOMATION_SCRIPT;
     use crate::backend::fetch::CHECKSUM_SUFFIX;
     use crate::backend::network::{Connection, Wifi};
     use crate::backend::signature::SIGNATURE_SUFFIX;
@@ -432,6 +433,8 @@ mod tests {
     const KEY: &str = "MichaIng.gpg";
     const DIETPI_TXT: &str = "AUTO_SETUP_NET_ETHERNET_ENABLED=1\nAUTO_SETUP_NET_WIFI_ENABLED=0\nAUTO_SETUP_NET_WIFI_COUNTRY_CODE=GB\n";
     const DIETPI_WIFI_TXT: &str = "aWIFI_SSID[0]=''\naWIFI_KEY[0]=''\naWIFI_KEYMGR[0]='WPA-PSK'\n";
+    const CMDLINE_TXT: &str = "root=PARTUUID=d6e7fee7-02 rootfstype=ext4 rootwait fsck.repair=yes net.ifnames=0 logo.nologo console=serial0,115200 console=tty1\n";
+    const MESH_NETWORK_KEY: &str = "tskey-auth-kABC123-xyz789";
 
     fn routes(image: &[u8], signature: Vec<u8>, key: Vec<u8>) -> HashMap<String, Reply> {
         HashMap::from([
@@ -513,6 +516,7 @@ mod tests {
             connection,
             hostname: "mypi".to_owned(),
             password: "a-long-password".to_owned(),
+            mesh_network_auth_key: MESH_NETWORK_KEY.to_owned(),
         }
     }
 
@@ -524,6 +528,7 @@ mod tests {
         boot_image(&[
             ("dietpi.txt", DIETPI_TXT),
             ("dietpi-wifi.txt", DIETPI_WIFI_TXT),
+            ("cmdline.txt", CMDLINE_TXT),
         ])
     }
 
@@ -570,9 +575,13 @@ mod tests {
         let flashable = std::fs::read(&obtained.flashable).unwrap();
         assert_eq!(
             boot_file(&flashable, "dietpi.txt"),
-            "AUTO_SETUP_NET_ETHERNET_ENABLED=1\nAUTO_SETUP_NET_WIFI_ENABLED=0\nAUTO_SETUP_NET_WIFI_COUNTRY_CODE=GB\nAUTO_SETUP_NET_HOSTNAME=mypi\nAUTO_SETUP_GLOBAL_PASSWORD=a-long-password\nAUTO_SETUP_SSH_SERVER_INDEX=-2\nAUTO_SETUP_AUTOMATED=1\n"
+            "AUTO_SETUP_NET_ETHERNET_ENABLED=1\nAUTO_SETUP_NET_WIFI_ENABLED=0\nAUTO_SETUP_NET_WIFI_COUNTRY_CODE=GB\nAUTO_SETUP_NET_HOSTNAME=mypi\nAUTO_SETUP_GLOBAL_PASSWORD=a-long-password\nAUTO_SETUP_SSH_SERVER_INDEX=-2\nAUTO_SETUP_INSTALL_SOFTWARE_ID=9 58\nAUTO_SETUP_CUSTOM_SCRIPT_EXEC=0\nAUTO_SETUP_AUTOMATED=1\n"
         );
         assert_eq!(boot_file(&flashable, "dietpi-wifi.txt"), DIETPI_WIFI_TXT);
+        assert_eq!(
+            boot_file(&flashable, "cmdline.txt"),
+            "root=PARTUUID=d6e7fee7-02 rootfstype=ext4 rootwait fsck.repair=yes net.ifnames=0 logo.nologo console=serial0,115200 console=tty1 lsm=landlock,lockdown,yama,integrity,apparmor\n"
+        );
         assert_eq!(
             steps(&log),
             [
@@ -749,7 +758,7 @@ mod tests {
         let flashable = std::fs::read(&obtained.flashable).unwrap();
         assert_eq!(
             boot_file(&flashable, "dietpi.txt"),
-            "AUTO_SETUP_NET_ETHERNET_ENABLED=0\nAUTO_SETUP_NET_WIFI_ENABLED=1\nAUTO_SETUP_NET_WIFI_COUNTRY_CODE=GB\nAUTO_SETUP_NET_HOSTNAME=mypi\nAUTO_SETUP_GLOBAL_PASSWORD=a-long-password\nAUTO_SETUP_SSH_SERVER_INDEX=-2\nAUTO_SETUP_AUTOMATED=1\n"
+            "AUTO_SETUP_NET_ETHERNET_ENABLED=0\nAUTO_SETUP_NET_WIFI_ENABLED=1\nAUTO_SETUP_NET_WIFI_COUNTRY_CODE=GB\nAUTO_SETUP_NET_HOSTNAME=mypi\nAUTO_SETUP_GLOBAL_PASSWORD=a-long-password\nAUTO_SETUP_SSH_SERVER_INDEX=-2\nAUTO_SETUP_INSTALL_SOFTWARE_ID=9 58\nAUTO_SETUP_CUSTOM_SCRIPT_EXEC=0\nAUTO_SETUP_AUTOMATED=1\n"
         );
         assert_eq!(
             boot_file(&flashable, "dietpi-wifi.txt"),
@@ -760,6 +769,36 @@ mod tests {
         assert!(!rendered.contains("correct horse"), "{rendered}");
         assert!(!rendered.contains("Home Network"), "{rendered}");
         assert!(!rendered.contains("a-long-password"), "{rendered}");
+    }
+
+    /// A run writes the Mesh Network auth key into the boot partition of the decompressed file, and the log never shows it.
+    #[tokio::test]
+    async fn a_run_writes_the_mesh_network_key_to_the_boot_partition_and_never_logs_it() {
+        let publisher = Publisher::new();
+        let image = xz(&boot_disk());
+        let base = serve(routes(
+            &image,
+            publisher.sign(&image),
+            publisher.armored_key(),
+        ));
+        let dir = tempdir().unwrap();
+        let mut log = StepLog::default();
+        let cancel = CancellationToken::new();
+
+        let obtained = obtain(&base, dir.path(), &cancel, |_| {}, &mut log)
+            .await
+            .unwrap();
+
+        let flashable = std::fs::read(&obtained.flashable).unwrap();
+        assert_eq!(
+            boot_file(&flashable, "user-defined-credentials.txt"),
+            "MESH_NETWORK_AUTH_KEY=tskey-auth-kABC123-xyz789\n"
+        );
+        assert_eq!(
+            boot_file(&flashable, "Automation_Custom_Script.sh"),
+            AUTOMATION_SCRIPT
+        );
+        assert!(!log.to_string().contains(MESH_NETWORK_KEY), "{log}");
     }
 
     /// A Wi-Fi run on an image with no FAT boot partition fails with the reason logged, and removes the decompressed file.

@@ -4,6 +4,7 @@ pub mod decompress;
 pub mod fetch;
 pub mod image;
 pub mod log;
+pub mod mesh_network;
 pub mod network;
 pub mod partition;
 pub mod preferences;

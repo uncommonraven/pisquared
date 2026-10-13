@@ -15,7 +15,7 @@ When complete, one interface walks you through:
 - [x] choosing PREFERENCES: orchestrator (herdr), harness (pi, opencode, or Claude Code), and sandbox (nono),
 - [x] entering network CREDENTIALS: your Wi-Fi network name and passkey
 - [x] entering device CREDENTIALS: hostname and password for the device
-- [ ] entering connectivity CREDENTIALS: a Tailscale auth key
+- [x] entering connectivity CREDENTIALS: a Tailscale auth key
 - [ ] choosing the drive to flash,
 - [x] confirming the choices,
 - [x] downloading the DietPi image for the device and checking it against its published checksum and signature,
